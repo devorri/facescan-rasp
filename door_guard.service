@@ -1,0 +1,19 @@
+[Unit]
+Description=Lab Access Control — Door Guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=facescan
+WorkingDirectory=/home/facescan/facescan
+EnvironmentFile=/home/facescan/facescan/.env
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/libcamerify /home/facescan/facescan/venv/bin/python /home/facescan/facescan/door_guard.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
