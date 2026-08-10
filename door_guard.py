@@ -110,9 +110,15 @@ FRAME_SCALE_FACTOR: float   = 0.5   # Downscale factor for faster processing
 COOLDOWN_SECONDS: int = 8           # Minimum seconds between repeated decisions
 
 # -- GPIO / Relay ------------------------------------------------------------
-RELAY_PIN: int        = 18          # BCM pin number
-RELAY_ACTIVE_LOW: bool = False       # Set to False if your relay triggers on HIGH signal
+RELAY_PIN: int        = 18          # BCM pin number — Physical Pin 12
+RELAY_ACTIVE_LOW: bool = False       # False = LOW signal is OFF (LOCKED), HIGH signal is ON (UNLOCKED)
 DOOR_OPEN_SECONDS: int = 5          # How long to keep the solenoid unlocked
+
+# -- Manual Override Button --------------------------------------------------
+# Wire: one leg of button → GPIO 27 (Physical Pin 13), other leg → GND
+# Internal pull-up is enabled; button press pulls pin LOW.
+BUTTON_PIN: int = 27                # BCM pin number — Physical Pin 13
+BUTTON_DEBOUNCE_MS: int = 300       # Milliseconds to debounce button presses
 
 # -- Camera ------------------------------------------------------------------
 CAMERA_INDEX: int = 0               # 0 = /dev/video0 (Pi Camera or USB cam)
@@ -723,15 +729,18 @@ def start_enrollment_server(client: Client, port: int = 5000) -> None:
 # =============================================================================
 
 def setup_gpio() -> None:
-    """Configure GPIO pin for the relay.  Safe to call on a non-Pi host."""
+    """Configure GPIO pins for relay and manual override button.  Safe to call on a non-Pi host."""
     if not ON_PI:
         return
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
-    # Initialise pin to the *locked* state before setting as output
+    # Relay pin — initialise to LOCKED state
     initial = GPIO.HIGH if RELAY_ACTIVE_LOW else GPIO.LOW
     GPIO.setup(RELAY_PIN, GPIO.OUT, initial=initial)
     log.info("GPIO pin %d configured (relay initialised to LOCKED).", RELAY_PIN)
+    # Button pin — internal pull-up; button press pulls LOW
+    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    log.info("GPIO pin %d configured (manual override button, pull-up).", BUTTON_PIN)
 
 
 def unlock_door() -> None:
@@ -763,6 +772,49 @@ def unlock_door() -> None:
 
     thread = threading.Thread(target=_relay_pulse, daemon=True, name="relay-pulse")
     thread.start()
+
+
+def start_button_listener() -> None:
+    """
+    Background listener that watches BUTTON_PIN for a physical button press.
+    Each press triggers unlock_door() — same as a face-recognition grant.
+    Wiring: button leg A → GPIO 27 (Physical Pin 13), button leg B → GND.
+    """
+    if not ON_PI:
+        log.info("Button listener skipped (not on Pi).")
+        return
+
+    def _on_button_pressed(channel: int) -> None:
+        log.info("🔘 Manual override button pressed (GPIO %d) — triggering door unlock.", channel)
+        add_history_entry("Manual Button", "granted", "Physical override button pressed")
+        unlock_door()
+
+    try:
+        GPIO.add_event_detect(
+            BUTTON_PIN,
+            GPIO.FALLING,
+            callback=_on_button_pressed,
+            bouncetime=BUTTON_DEBOUNCE_MS,
+        )
+        log.info("🔘 Manual override button listener active on GPIO %d.", BUTTON_PIN)
+    except Exception as exc:
+        log.warning("Failed to register GPIO event detect: %s. Using polling fallback.", exc)
+
+        def _poll() -> None:
+            last_state = GPIO.HIGH
+            while True:
+                try:
+                    state = GPIO.input(BUTTON_PIN)
+                    if last_state == GPIO.HIGH and state == GPIO.LOW:
+                        _on_button_pressed(BUTTON_PIN)
+                        time.sleep(BUTTON_DEBOUNCE_MS / 1000.0)
+                    last_state = state
+                    time.sleep(0.05)
+                except Exception:
+                    time.sleep(0.5)
+
+        t = threading.Thread(target=_poll, daemon=True, name="button-poll")
+        t.start()
 
 
 def cleanup_gpio() -> None:
@@ -1710,6 +1762,7 @@ def main() -> None:
 
     # 1. Initialise hardware
     setup_gpio()
+    start_button_listener()
 
     # 2. Connect to Supabase
     client = init_supabase()
