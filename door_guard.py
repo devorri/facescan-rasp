@@ -127,7 +127,7 @@ CAMERA_INDEX: int = 0               # 0 = /dev/video0 (Pi Camera or USB cam)
 # Access is only granted between these times on the allowed weekdays.
 # Weekday numbers: Monday=0, Tuesday=1, ..., Saturday=5  (Sunday=6 is excluded)
 OP_HOURS_START: int = 7             # 7:00 AM  (24-h hour)
-OP_HOURS_END:   int = 17            # 5:00 PM  (24-h hour, exclusive boundary)
+OP_HOURS_END:   int = 19            # 7:00 PM  (24-h hour, exclusive boundary)
 OP_DAYS: set[int] = {0, 1, 2, 3, 4, 5}  # Monday–Saturday
 
 
@@ -154,11 +154,17 @@ latest_frame = None
 enrollment_status: str = "idle"
 enrollment_name: str = ""
 
-# 🔥 NEW: Pi mode control & thread safety lock for dlib / face_recognition
+# 🔥 Pi mode control & thread safety lock for dlib / face_recognition
 pi_mode: str = "recognition"  # 'recognition' | 'enrollment' | 'idle'
 pi_mode_lock = threading.Lock()
 dlib_lock = threading.Lock()  # Protect dlib C++ calls from concurrent thread execution
 pi_mode_last_sync: float = 0
+
+# 🚀 Asynchronous 30 FPS face recognition state for UI overlay
+active_face_locations: list = []
+active_face_label: str = ""
+active_box_color: tuple[int, int, int] = (0, 255, 0)
+face_worker_running: bool = True
 
 
 def _l2_norm(v: np.ndarray) -> np.ndarray:
@@ -471,13 +477,15 @@ def start_realtime_listener(client: Client) -> None:
         global enrollment_status, enrollment_name, pi_mode
         log.info("Background profile sync & capture daemon active (polling every 2s).")
         cycle = 0
+        last_pushed_tuple = None
         while True:
             time.sleep(2)
             try:
                 cycle += 1
                 
-                # 1. Sync mode from database (app might have changed it)
-                sync_pi_mode_with_database(client)
+                # 1. Sync mode from database (every 6 seconds / 3 cycles)
+                if cycle % 3 == 0:
+                    sync_pi_mode_with_database(client)
                 
                 # 2. Check face status
                 cam_ready, face_detected = _quick_face_check()
@@ -486,14 +494,16 @@ def start_realtime_listener(client: Client) -> None:
                 cam_ready_status = cam_ready
                 face_in_frame_status = face_detected
                 
-                # 4. Push live camera + face detection state to Supabase
-                _push_pi_status(cam_ready, face_detected)
+                # 4. Push live camera + face detection state to Supabase only on change or every 10s
+                with pi_mode_lock:
+                    current_mode = pi_mode
+                current_status_tuple = (cam_ready, face_detected, current_mode)
+                if current_status_tuple != last_pushed_tuple or cycle % 5 == 0:
+                    _push_pi_status(cam_ready, face_detected)
+                    last_pushed_tuple = current_status_tuple
 
                 # 5. Process any pending face capture requests in Supabase
                 # 🔥 ONLY process enrollment if in enrollment mode
-                with pi_mode_lock:
-                    current_mode = pi_mode
-                
                 if current_mode == "enrollment":
                     res = client.table("profiles").select("*").eq("camera_status", "pending").execute()
                     if res.data and len(res.data) > 0:
@@ -507,9 +517,6 @@ def start_realtime_listener(client: Client) -> None:
                             client.table("profiles").update({"camera_status": "capturing"}).eq("id", pid).execute()
                             enrollment_status = "capturing"
 
-                            # Use the cached frame from the main recognition loop.
-                            # Opening a new cv2.VideoCapture() here would fail because
-                            # the main loop already holds the camera device exclusively.
                             frame = latest_frame
                             if frame is not None:
                                 ret, frame = True, frame.copy()
@@ -535,12 +542,10 @@ def start_realtime_listener(client: Client) -> None:
                                         enrollment_status = "failed_no_face"
                                         log.warning("⚠️ Pending capture failed: No face detected in frame.")
                             else:
-                                # latest_frame not available yet — main loop hasn't captured one
                                 log.warning("⚠️ latest_frame is None — main loop camera not ready yet. Retrying next cycle.")
                                 client.table("profiles").update({"camera_status": "failed_camera_error"}).eq("id", pid).execute()
                                 enrollment_status = "failed_camera_error"
                 else:
-                    # Not in enrollment mode - don't process enrollments
                     if enrollment_status != "idle":
                         enrollment_status = "idle"
 
@@ -552,6 +557,67 @@ def start_realtime_listener(client: Client) -> None:
 
     thread = threading.Thread(target=poll_forever, daemon=True, name="profile-sync")
     thread.start()
+
+
+def start_remote_unlock_listener(client: Client) -> None:
+    """
+    Dedicated, high-priority background listener for remote force unlock events from Supabase.
+    Runs in its own lightweight thread (polling every 0.75s) to guarantee fast < 1s response.
+    """
+    def _poll_unlock():
+        log.info("⚡ Fast Remote Unlock listener active (polling Supabase access_logs every 0.75s).")
+        last_processed_unlock_id = None
+
+        if LABORATORY_ID:
+            try:
+                res = (
+                    client.table("access_logs")
+                    .select("id")
+                    .eq("laboratory_id", LABORATORY_ID)
+                    .eq("decision", "granted")
+                    .ilike("reason", "Manual Force Unlock%")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if res.data and len(res.data) > 0:
+                    last_processed_unlock_id = res.data[0].get("id")
+                    log.info("Initial latest unlock ID recorded: %s", last_processed_unlock_id)
+            except Exception as e:
+                log.debug("Initial unlock ID fetch error: %s", e)
+
+        while True:
+            time.sleep(0.75)
+            if not LABORATORY_ID:
+                continue
+            try:
+                unlock_res = (
+                    client.table("access_logs")
+                    .select("id, reason, created_at")
+                    .eq("laboratory_id", LABORATORY_ID)
+                    .eq("decision", "granted")
+                    .ilike("reason", "Manual Force Unlock%")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if unlock_res.data and len(unlock_res.data) > 0:
+                    latest_unlock = unlock_res.data[0]
+                    latest_id = latest_unlock.get("id")
+                    if last_processed_unlock_id is None:
+                        last_processed_unlock_id = latest_id
+                    elif latest_id != last_processed_unlock_id:
+                        last_processed_unlock_id = latest_id
+                        u_reason = latest_unlock.get("reason", "Manual Force Unlock")
+                        log.info(f"🔓 Supabase Manual Unlock detected: {u_reason}")
+                        add_history_entry("Remote App", "granted", u_reason)
+                        unlock_door()
+            except Exception as unlock_err:
+                log.debug(f"Remote unlock poll error: {unlock_err}")
+                time.sleep(1.0)
+
+    t = threading.Thread(target=_poll_unlock, daemon=True, name="remote-unlock-poll")
+    t.start()
 
 
 # =============================================================================
@@ -591,6 +657,22 @@ class EnrollmentRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         global pi_mode
         
+        # --- Remote Manual Unlock endpoint ---
+        if self.path == "/unlock":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body_bytes = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+                reason = payload.get("reason", "Manual Force Unlock (Mobile App)")
+                log.info(f"🔓 Direct HTTP /unlock received: {reason}")
+                add_history_entry("Remote App", "granted", reason)
+                unlock_door()
+                self._send_json(200, {"success": True, "message": "Door unlocked"})
+            except Exception as exc:
+                log.error(f"Error handling /unlock: {exc}")
+                self._send_json(500, {"success": False, "error": str(exc)})
+            return
+
         # --- Set Pi Mode ---
         if self.path == "/mode":
             content_length = int(self.headers.get("Content-Length", 0))
@@ -715,7 +797,7 @@ def start_enrollment_server(client: Client, port: int = 5000) -> None:
         try:
             httpd = HTTPServer(server_address, EnrollmentRequestHandler)
             log.info(f"🌐 Pi Control Server listening on port {port} ...")
-            log.info(f"📡 Endpoints: /status, /mode, /enroll")
+            log.info(f"📡 Endpoints: /status, /mode, /enroll, /unlock")
             httpd.serve_forever()
         except Exception as exc:
             log.error(f"Failed to start HTTP Server: {exc}")
@@ -749,6 +831,8 @@ def unlock_door() -> None:
     then de-energise to lock again.  Runs in a background thread so the
     recognition loop is not blocked.
     """
+    global last_decision_time
+    last_decision_time = time.time()
 
     def _relay_pulse() -> None:
         try:
@@ -920,7 +1004,7 @@ max_history_items: int = 5
 
 def add_history_entry(name: str, decision: str, reason: str) -> None:
     """Record a scan result to the live activity feed display."""
-    global last_event_text, last_event_color
+    global last_event_text, last_event_color, last_decision_time
     t_str = time.strftime("%I:%M:%S %p")
     entry = {
         "time": t_str,
@@ -933,6 +1017,7 @@ def add_history_entry(name: str, decision: str, reason: str) -> None:
         access_history.pop()
 
     if decision == "granted":
+        last_decision_time = time.time()
         last_event_text = f"GRANTED: {name} — Door Unlocked"
         last_event_color = (0, 255, 120)
     elif "Outside" in reason:
@@ -1002,16 +1087,6 @@ def render_pygame_kiosk(
     clock_surf = fonts["bold"].render(t_str, True, (250, 204, 21))
     screen.blit(clock_surf, (win_w - clock_surf.get_width() - 20, 18))
 
-    # Mode indicator in header
-    mode_colors = {
-        'recognition': GREEN,
-        'enrollment': ORANGE,
-        'idle': TEXT_MUTED
-    }
-    mode_color = mode_colors.get(pi_mode, TEXT_MUTED)
-    mode_surf = fonts["bold"].render(f"[{pi_mode.upper()}]", True, mode_color)
-    screen.blit(mode_surf, (win_w - 200, 16))
-
     # --- 2. LEFT PANEL: CAMERA VIEWPORT (640x480) ---
     cam_x, cam_y = 20, 80
     cam_w, cam_h = 640, 480
@@ -1021,9 +1096,12 @@ def render_pygame_kiosk(
     pygame.draw.rect(screen, CARD_BORDER, (cam_x, cam_y, cam_w, cam_h), 2, border_radius=8)
 
     if camera_surface is not None:
-        # Scale & blit live camera feed
-        scaled_cam = pygame.transform.smoothscale(camera_surface, (cam_w, cam_h))
-        screen.blit(scaled_cam, (cam_x, cam_y))
+        # Blit live camera feed (direct blit if matching size, or fast scale)
+        if camera_surface.get_size() == (cam_w, cam_h):
+            screen.blit(camera_surface, (cam_x, cam_y))
+        else:
+            scaled_cam = pygame.transform.scale(camera_surface, (cam_w, cam_h))
+            screen.blit(scaled_cam, (cam_x, cam_y))
 
         # Render Bounding Box & Target Reticle
         if face_locations and len(face_locations) > 0:
@@ -1096,7 +1174,7 @@ def render_pygame_kiosk(
     screen.blit(t_hdr, (right_x + 16, 182))
 
     t1 = fonts["small"].render(f"Enrolled Profiles: {len(known_faces)} faces   |   Camera: /dev/video{active_idx}", True, TEXT_MUTED)
-    t2 = fonts["small"].render(f"Operating Hours:  7:00 AM - 5:00 PM  (Mon - Sat)", True, TEXT_MUTED)
+    t2 = fonts["small"].render(f"Operating Hours:  7:00 AM - 7:00 PM  (Mon - Sat)", True, TEXT_MUTED)
     screen.blit(t1, (right_x + 16, 210))
     screen.blit(t2, (right_x + 16, 228))
 
@@ -1256,24 +1334,6 @@ def draw_dashboard_overlay(
 
     # Pulsing Live Dot (Neon Green)
     cv2.circle(frame, (w - 180, 30), 5, (0, 255, 120), -1, cv2.LINE_AA)
-    
-    # Mode display
-    mode_colors = {
-        'recognition': (0, 255, 0),
-        'enrollment': (0, 165, 255),
-        'idle': (128, 128, 128)
-    }
-    mode_color = mode_colors.get(pi_mode, (255, 255, 255))
-    cv2.putText(
-        frame,
-        f"MODE: {pi_mode.upper()}",
-        (w - 200, 55),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        mode_color,
-        2,
-        cv2.LINE_AA,
-    )
 
     # --- 3. Telemetry Card Content (Top Right) ---
     door_locked = not (time.time() - last_decision_time < DOOR_OPEN_SECONDS and "GRANTED" in last_event_text)
@@ -1287,7 +1347,7 @@ def draw_dashboard_overlay(
     cv2.putText(frame, f"DOOR: {lock_str}", (w - card_w, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.48, lock_col, 2, cv2.LINE_AA)
     cv2.putText(frame, f"USER: {user_display[:20]}", (w - card_w, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.48, user_col, 2, cv2.LINE_AA)
     cv2.putText(frame, f"FACES LOADED: {len(known_faces)} profiles", (w - card_w, 142), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"HOURS: 7 AM - 5 PM (Mon-Sat)", (w - card_w, 162), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 170, 180), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"HOURS: 7 AM - 7 PM (Mon-Sat)", (w - card_w, 162), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 170, 180), 1, cv2.LINE_AA)
 
     # --- 4. Bottom Activity Ticker ---
     cv2.putText(
@@ -1462,12 +1522,13 @@ def smart_open_camera() -> tuple[object, int]:
 
 def run_recognition_loop(client: Client) -> None:
     """
-    Continuously capture frames, but behavior depends on pi_mode.
+    Continuously capture and display camera frames at full 30 FPS,
+    while face detection and recognition run asynchronously in a dedicated worker thread.
     """
-    # 🔥 CRITICAL: Declare globals at the start of the function
     global last_decision_time, last_event_text, last_event_color
     global face_in_frame_status, cam_ready_status, latest_frame
     global current_status_label, current_status_color, pi_mode
+    global active_face_locations, active_face_label, active_box_color, face_worker_running
 
     if face_recognition is None:
         log.error(
@@ -1501,6 +1562,127 @@ def run_recognition_loop(client: Client) -> None:
     log.info("Initialising camera stream ...")
     cap, active_idx = smart_open_camera()
 
+    # --- Background Face Recognition Worker Thread ---
+    def _face_worker() -> None:
+        global active_face_locations, active_face_label, active_box_color
+        global face_in_frame_status, last_detected_name, last_decision_time
+        log.info("⚡ Parallel Face Recognition worker started.")
+        while face_worker_running:
+            try:
+                with pi_mode_lock:
+                    current_mode = pi_mode
+
+                if current_mode == "idle" or latest_frame is None:
+                    active_face_locations = []
+                    active_face_label = "SYSTEM IDLE - Maintenance Mode" if current_mode == "idle" else ""
+                    active_box_color = (128, 128, 128)
+                    time.sleep(0.1)
+                    continue
+
+                frame_copy = latest_frame.copy()
+                small_frame = cv2.resize(
+                    frame_copy,
+                    (0, 0),
+                    fx=FRAME_SCALE_FACTOR,
+                    fy=FRAME_SCALE_FACTOR,
+                )
+                rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+                with dlib_lock:
+                    face_locs = face_recognition.face_locations(rgb_small)
+
+                face_in_frame_status = len(face_locs) > 0
+
+                if not face_locs:
+                    active_face_locations = []
+                    active_face_label = ""
+                    active_box_color = (255, 255, 255)
+                    last_detected_name = ""
+                    time.sleep(0.08)
+                    continue
+
+                # In enrollment mode, just show detection box
+                if current_mode == "enrollment":
+                    active_face_locations = face_locs
+                    active_face_label = "ENROLLMENT MODE - Face Detected"
+                    active_box_color = (0, 255, 0)
+                    time.sleep(0.08)
+                    continue
+
+                # Recognition mode
+                with dlib_lock:
+                    face_embeddings = face_recognition.face_encodings(rgb_small, face_locs)
+
+                if not face_embeddings:
+                    active_face_locations = []
+                    active_face_label = ""
+                    active_box_color = (255, 255, 255)
+                    last_detected_name = ""
+                    time.sleep(0.08)
+                    continue
+
+                live_embedding = np.array(face_embeddings[0], dtype=np.float64)
+                faculty_id, name, distance = find_best_match(live_embedding)
+                last_detected_name = name if name else "Unknown Face"
+                active_face_locations = face_locs
+
+                now = time.time()
+                if now - last_decision_time < COOLDOWN_SECONDS:
+                    active_face_label = f"{name} ({distance:.2f})" if name else f"Unknown ({distance:.2f})"
+                    active_box_color = (0, 255, 0) if name else (0, 0, 255)
+                    time.sleep(0.08)
+                    continue
+
+                # Access decision
+                if faculty_id:
+                    is_sched_ok, sched_msg = check_faculty_schedule_status(faculty_id)
+                    if is_sched_ok:
+                        log.info("ACCESS GRANTED — %s (%s, dist=%.4f)", name, sched_msg, distance)
+                        unlock_door()
+                        log_access(
+                            client,
+                            decision="granted",
+                            faculty_id=faculty_id,
+                            reason=f"Granted: {name} | {sched_msg}",
+                        )
+                        active_box_color = (0, 255, 0)
+                        active_face_label = f"GRANTED: {name}"
+                        add_history_entry(name, "granted", f"Schedule OK ({sched_msg})")
+                        last_decision_time = now
+                    else:
+                        log.info("ACCESS DENIED — %s: %s (dist=%.4f)", name, sched_msg, distance)
+                        log_access(
+                            client,
+                            decision="denied",
+                            faculty_id=faculty_id,
+                            reason=f"Denied: {sched_msg}",
+                        )
+                        active_box_color = (0, 165, 255)
+                        active_face_label = f"DENIED: {name} (No Sched)"
+                        add_history_entry(name, "denied", sched_msg)
+                        last_decision_time = now
+                else:
+                    log.info("ACCESS DENIED — Unknown face (dist=%.4f)", distance)
+                    log_access(
+                        client,
+                        decision="denied",
+                        faculty_id=None,
+                        reason="Unknown face",
+                    )
+                    active_box_color = (0, 0, 255)
+                    active_face_label = "DENIED: Unknown"
+                    add_history_entry("Unknown Face", "denied", "Unknown face profile")
+                    last_decision_time = now
+
+                time.sleep(0.08)  # Prevents 100% CPU lockup and thermal throttling
+            except Exception as w_err:
+                log.warning("Face worker error: %s", w_err)
+                time.sleep(0.2)
+
+    face_worker_running = True
+    worker_t = threading.Thread(target=_face_worker, daemon=True, name="face-worker")
+    worker_t.start()
+
     log.info("Recognition loop started — press Ctrl+C to stop.")
     window_title = "Lab Access Control — Security Kiosk"
 
@@ -1514,10 +1696,6 @@ def run_recognition_loop(client: Client) -> None:
                     if ev.type == pygame.QUIT or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_q):
                         return
 
-            # Check current mode
-            with pi_mode_lock:
-                current_mode = pi_mode
-
             if cap is not None and cap.isOpened():
                 ret, frame = cap.read()
                 if ret and frame is not None:
@@ -1527,19 +1705,14 @@ def run_recognition_loop(client: Client) -> None:
                 else:
                     ret, frame = False, None
                     cam_ready_status = False
-                    face_in_frame_status = False
                     failed_frame_count += 1
             else:
                 ret, frame = False, None
                 cam_ready_status = False
-                face_in_frame_status = False
                 failed_frame_count += 1
 
             if not ret or frame is None or frame.size == 0:
                 cam_ready_status = False
-                face_in_frame_status = False
-                
-                # Attempt camera reconnect after 50 consecutive failures (~5 seconds)
                 if failed_frame_count >= 50 and failed_frame_count % 50 == 0:
                     log.warning("Camera stream offline. Attempting to re-acquire camera stream...")
                     try:
@@ -1556,187 +1729,44 @@ def run_recognition_loop(client: Client) -> None:
                     cv2.putText(standby, "SEARCHING FOR CAMERA STREAM...", (100, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
                     if safe_show_frame(window_title, standby):
                         break
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
 
             # Convert BGR frame to Pygame Surface for Crisp UI rendering
             cam_surface = None
             if PYGAME_AVAILABLE and pg_screen is not None:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Swap axes for pygame surfarray
                 cam_surface = pygame.surfarray.make_surface(rgb_frame.swapaxes(0, 1))
 
             # ------------------------------------------------------------------
-            # 1. Downscale the frame for faster face detection
-            # ------------------------------------------------------------------
-            small_frame = cv2.resize(
-                frame,
-                (0, 0),
-                fx=FRAME_SCALE_FACTOR,
-                fy=FRAME_SCALE_FACTOR,
-            )
-            rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-
-            # ------------------------------------------------------------------
-            # 2. Detect face locations and compute 128-d embeddings
-            # ------------------------------------------------------------------
-            with dlib_lock:
-                face_locations = face_recognition.face_locations(rgb_small)
-            
-            # 🔥 Update the global face detection status
-            face_in_frame_status = len(face_locations) > 0
-
-            # ------------------------------------------------------------------
-            # 3. BEHAVIOR BASED ON MODE
-            # ------------------------------------------------------------------
-            
-            # 🔥 ENROLLMENT MODE: Don't check door, just show face detection
-            if current_mode == "enrollment":
-                # Just show the face with detection box, no door logic
-                label = "ENROLLMENT MODE - Face Detected" if face_in_frame_status else "ENROLLMENT MODE - No Face"
-                color = (0, 255, 0) if face_in_frame_status else (255, 255, 255)
-                
-                if PYGAME_AVAILABLE and pg_screen is not None:
-                    render_pygame_kiosk(
-                        pg_screen, fonts, camera_surface=cam_surface,
-                        face_locations=face_locations, face_label=label, box_color=color, active_idx=active_idx
-                    )
-                else:
-                    frame_hud = draw_dashboard_overlay(frame, face_locations, face_label=label, box_color=color)
-                    if safe_show_frame(window_title, frame_hud):
-                        break
-                continue
-            
-            # 🔥 IDLE MODE: Show camera but don't process anything
-            if current_mode == "idle":
-                label = "SYSTEM IDLE - Maintenance Mode"
-                color = (128, 128, 128)
-                
-                if PYGAME_AVAILABLE and pg_screen is not None:
-                    render_pygame_kiosk(
-                        pg_screen, fonts, camera_surface=cam_surface,
-                        face_locations=face_locations, face_label=label, box_color=color, active_idx=active_idx
-                    )
-                else:
-                    frame_hud = draw_dashboard_overlay(frame, face_locations, face_label=label, box_color=color)
-                    if safe_show_frame(window_title, frame_hud):
-                        break
-                continue
-
-            # 🔥 RECOGNITION MODE: Normal operation
-            # Only process recognition if in recognition mode
-            with dlib_lock:
-                face_embeddings = face_recognition.face_encodings(rgb_small, face_locations)
-
-            if not face_embeddings:
-                # No face - render with no detection
-                last_detected_name = ""
-                if PYGAME_AVAILABLE and pg_screen is not None:
-                    render_pygame_kiosk(
-                        pg_screen, fonts, 
-                        camera_surface=cam_surface,
-                        face_locations=[], 
-                        face_label="",
-                        box_color=(255, 255, 255),
-                        active_idx=active_idx
-                    )
-                else:
-                    frame_hud = draw_dashboard_overlay(frame)
-                    if safe_show_frame(window_title, frame_hud):
-                        break
-                continue
-
-            # ------------------------------------------------------------------
-            # 4. Process the first (most prominent) face detected
-            # ------------------------------------------------------------------
-            live_embedding = np.array(face_embeddings[0], dtype=np.float64)
-            faculty_id, name, distance = find_best_match(live_embedding)
-            last_detected_name = name if name else "Unknown Face"
-
-            # ------------------------------------------------------------------
-            # 5. Cooldown check — skip if we decided recently
-            # ------------------------------------------------------------------
-            now = time.time()
-            if now - last_decision_time < COOLDOWN_SECONDS:
-                label = f"{name} ({distance:.2f})" if name else f"Unknown ({distance:.2f})"
-                color = (0, 255, 0) if name else (0, 0, 255)
-
-                if PYGAME_AVAILABLE and pg_screen is not None:
-                    render_pygame_kiosk(
-                        pg_screen, fonts, camera_surface=cam_surface,
-                        face_locations=face_locations, face_label=label, box_color=color, active_idx=active_idx
-                    )
-                else:
-                    frame_hud = draw_dashboard_overlay(frame, face_locations, face_label=label, box_color=color)
-                    if safe_show_frame(window_title, frame_hud):
-                        break
-                continue
-
-            # ------------------------------------------------------------------
-            # 6. Access decision (only in recognition mode)
-            # ------------------------------------------------------------------
-
-            # -- 6a. Strict Schedule Verification ----------------------------
-            if faculty_id:
-                is_sched_ok, sched_msg = check_faculty_schedule_status(faculty_id)
-
-                if is_sched_ok:
-                    # ---- GRANTED ------------------------------------------------
-                    log.info("ACCESS GRANTED — %s (%s, dist=%.4f)", name, sched_msg, distance)
-                    unlock_door()
-                    log_access(
-                        client,
-                        decision="granted",
-                        faculty_id=faculty_id,
-                        reason=f"Granted: {name} | {sched_msg}",
-                    )
-                    overlay_color = (0, 255, 0)   # Green
-                    label = f"GRANTED: {name}"
-                    add_history_entry(name, "granted", f"Schedule OK ({sched_msg})")
-                    last_decision_time = now
-                else:
-                    # ---- DENIED (Schedule Constraint) ---------------------------
-                    log.info("ACCESS DENIED — %s: %s (dist=%.4f)", name, sched_msg, distance)
-                    log_access(
-                        client,
-                        decision="denied",
-                        faculty_id=faculty_id,
-                        reason=f"Denied: {sched_msg}",
-                    )
-                    overlay_color = (0, 165, 255)  # Orange/Red
-                    label = f"DENIED: {name} (No Sched)"
-                    add_history_entry(name, "denied", sched_msg)
-                    last_decision_time = now
-            else:
-                # ---- DENIED — Unknown face ----------------------------------
-                log.info("ACCESS DENIED — Unknown face (dist=%.4f)", distance)
-                log_access(
-                    client,
-                    decision="denied",
-                    faculty_id=None,
-                    reason="Unknown face",
-                )
-                overlay_color = (0, 0, 255)   # Red
-                label = "DENIED: Unknown"
-                add_history_entry("Unknown Face", "denied", "Unknown face profile")
-                last_decision_time = now
-
-            # ------------------------------------------------------------------
-            # 7. Render Pygame Kiosk UI / Fallback OpenCV Frame
+            # Render UI immediately with latest asynchronous face data (30 FPS)
             # ------------------------------------------------------------------
             if PYGAME_AVAILABLE and pg_screen is not None:
                 render_pygame_kiosk(
-                    pg_screen, fonts, camera_surface=cam_surface,
-                    face_locations=face_locations, face_label=label, box_color=overlay_color, active_idx=active_idx
+                    pg_screen,
+                    fonts,
+                    camera_surface=cam_surface,
+                    face_locations=active_face_locations,
+                    face_label=active_face_label,
+                    box_color=active_box_color,
+                    active_idx=active_idx,
                 )
             else:
-                frame_hud = draw_dashboard_overlay(frame, face_locations, face_label=label, box_color=overlay_color)
+                frame_hud = draw_dashboard_overlay(
+                    frame,
+                    face_locations=active_face_locations,
+                    face_label=active_face_label,
+                    box_color=active_box_color,
+                )
                 if safe_show_frame(window_title, frame_hud):
                     break
+
+            time.sleep(0.005)  # Yield GIL briefly so worker threads run smoothly
 
     except KeyboardInterrupt:
         log.info("Keyboard interrupt received — shutting down.")
     finally:
+        face_worker_running = False
         if cap is not None:
             cap.release()
         if PYGAME_AVAILABLE:
@@ -1781,15 +1811,18 @@ def main() -> None:
     # 6. Start background listener (handles enrollment, sync, status)
     start_realtime_listener(client)
     
-    # 7. Start HTTP control server (for app to change mode and enroll)
+    # 7. Start dedicated fast remote unlock listener (polls access_logs every 0.75s)
+    start_remote_unlock_listener(client)
+
+    # 8. Start HTTP control server (for app to change mode and enroll)
     start_enrollment_server(client, port=5000)
 
-    # 8. Start the recognition loop (blocks until user quits with Ctrl+C)
+    # 9. Start the recognition loop (blocks until user quits with Ctrl+C)
     log.info("🚀 Door Guard running in AUTO mode. App controls everything.")
     log.info("📱 Use the app to switch between: recognition | enrollment | idle")
     run_recognition_loop(client)
 
-    # 9. Clean up
+    # 10. Clean up
     cleanup_gpio()
     log.info("Door Guard stopped. Goodbye.")
 
