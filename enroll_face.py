@@ -26,6 +26,7 @@ from door_guard import (
     LivenessTracker,
     ENROLLMENT_SAMPLES_REQUIRED,
     ENROLLMENT_TIMEOUT_SECONDS,
+    MIN_ENROLL_FACE_SIZE_PX,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -59,10 +60,19 @@ def enroll_user(target: str) -> bool:
         res = client.table("profiles").select("*").ilike("name", f"%{target}%").execute()
 
     if not res.data:
-        log.error("No profile found matching '%s'. Create profile in App first.", target)
-        return False
+        log.info("No existing profile found for '%s' — creating new Faculty profile in Supabase...", target)
+        created = client.table("profiles").insert({
+            "name": target.strip(),
+            "role": "Faculty - CCS",
+            "camera_status": "idle",
+        }).execute()
+        if not created.data:
+            log.error("Failed to create profile '%s' in Supabase.", target)
+            return False
+        profile = created.data[0]
+    else:
+        profile = res.data[0]
 
-    profile = res.data[0]
     profile_id = profile["id"]
     profile_name = profile.get("name", "Unknown")
     log.info("Target Profile: %s (ID: %s)", profile_name, profile_id)
@@ -114,40 +124,39 @@ def enroll_user(target: str) -> bool:
                 max(0, min(w - 1, best_small[3] * 2)),
             )
 
-            is_suspect_2d, spoof_reason, lap_var = _check_2d_spoof_artifacts(frame, full_box)
+            is_suspect_2d, spoof_reason, lap_var = _check_2d_spoof_artifacts(
+                frame, full_box, min_size_px=MIN_ENROLL_FACE_SIZE_PX
+            )
             lm_list = face_recognition.face_landmarks(rgb, [full_box])
-            geom = _extract_face_geometry(lm_list[0], full_box, lap_var) if lm_list else None
+            geom = _extract_face_geometry(lm_list[0], full_box, lap_var, frame) if lm_list else None
             is_live, _ = tracker.update(geom, is_suspect_2d, spoof_reason, now=now)
 
             if (
                 geom is not None
                 and not is_suspect_2d
-                and geom["ear"] >= 0.18
-                and (now - last_emb_time) >= 0.30
-                and len(collected_embeddings) < (ENROLLMENT_SAMPLES_REQUIRED + 2)
+                and (now - last_emb_time) >= 0.20
+                and len(collected_embeddings) < ENROLLMENT_SAMPLES_REQUIRED
             ):
-                if len(collected_embeddings) < (ENROLLMENT_SAMPLES_REQUIRED - 1) or is_live:
-                    encs = face_recognition.face_encodings(rgb, [full_box])
-                    if encs:
-                        cand_emb = _l2_norm(np.array(encs[0], dtype=np.float64))
-                        if collected_embeddings:
-                            if float(1.0 - np.dot(cand_emb, collected_embeddings[0])) > 0.048:
-                                log.warning("Face changed during enrollment — resetting samples.")
-                                collected_embeddings.clear()
-                                tracker.reset()
-                                continue
-                        collected_embeddings.append(cand_emb)
-                        last_emb_time = now
+                encs = face_recognition.face_encodings(rgb, [full_box], num_jitters=2, model="large")
+                if encs:
+                    cand_emb = _l2_norm(np.array(encs[0], dtype=np.float64))
+                    if collected_embeddings:
+                        if float(1.0 - np.dot(cand_emb, collected_embeddings[0])) > 0.038:
+                            log.warning("Face changed during enrollment — resetting samples.")
+                            collected_embeddings.clear()
+                            continue
+                    collected_embeddings.append(cand_emb)
+                    last_emb_time = now
 
-            if is_live and len(collected_embeddings) >= ENROLLMENT_SAMPLES_REQUIRED:
+            if len(collected_embeddings) >= ENROLLMENT_SAMPLES_REQUIRED:
                 embedding = _l2_norm(np.mean(np.stack(collected_embeddings, axis=0), axis=0))
                 embedding_list = [float(val) for val in embedding]
-                log.info("Updating Supabase profile with live-verified 128-d face embedding...")
+                log.info("Updating Supabase profile with 128-d face embedding...")
                 client.table("profiles").update({
                     "face_embedding": embedding_list,
                     "camera_status": "completed",
                 }).eq("id", profile_id).execute()
-                log.info("✅ SUCCESS: Live-verified face embedding registered for '%s'!", profile_name)
+                log.info("✅ SUCCESS: Face embedding registered for '%s'!", profile_name)
                 return True
 
             time.sleep(0.03)

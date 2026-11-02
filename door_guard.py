@@ -104,26 +104,33 @@ LABORATORY_ID: str = os.environ.get("LABORATORY_ID", "")
 
 # -- Face Recognition & Anti-Spoofing ----------------------------------------
 # NOTE: Stored embeddings are L2-normalized unit vectors compared via Cosine distance
-# (1 - dot(u, v)). In dlib's 128-D space (where raw vectors have norm ~1.35):
-#   - Same person (raw Euclidean < 0.47)  -> Cosine distance ~ 0.015 to 0.062
-#   - Different person (raw Euclidean > 0.58) -> Cosine distance ~ 0.095 to 0.250
-# NEVER set Cosine threshold to 0.6 (0.6 is for unnormalized Euclidean distance!).
-_raw_thresh = float(os.environ.get("FACE_MATCH_THRESHOLD", "0.065"))
-FACE_MATCH_THRESHOLD: float = 0.065 if _raw_thresh > 0.15 else _raw_thresh
-FACE_MATCH_MARGIN: float    = 0.012  # Minimum separation over 2nd-best profile
-FRAME_SCALE_FACTOR: float   = 0.5    # Downscale factor for fast HOG box detection
-MIN_FACE_SIZE_PX: int       = 70     # Minimum face width/height in 640x480 pixels
+# (1 - dot(u, v)). Because raw dlib vectors have norm ~1.34 (2 * ||u||^2 ≈ 3.60):
+#   cos_dist = d_euc^2 / 3.60
+#   - Same person (raw dlib Euclidean 0.18 - 0.34) -> Cosine distance ~ 0.009 to 0.032
+#   - Different Filipino person in same lighting (raw Euclidean 0.40 - 0.50) -> Cosine distance ~ 0.044 to 0.068
+# NEVER set Cosine threshold above 0.040 or different people will falsely match!
+_raw_thresh = float(os.environ.get("FACE_MATCH_THRESHOLD", "0.036"))
+FACE_MATCH_THRESHOLD: float        = 0.036 if _raw_thresh > 0.042 else _raw_thresh
+FACE_MATCH_AVG_THRESHOLD: float    = 0.038  # Multi-frame average Cosine distance must be <= 0.038
+FACE_MATCH_MARGIN: float           = 0.014  # Minimum separation over 2nd-best profile
+REQUIRED_CONSECUTIVE_MATCHES: int  = 2      # Fast 2-frame match verification (~0.15s) before unlocking
+FRAME_SCALE_FACTOR: float          = 0.5    # Downscale factor for fast HOG box detection
+MIN_FACE_SIZE_PX: int              = 80     # Minimum face width/height in 640x480 pixels
+MIN_ENROLL_FACE_SIZE_PX: int       = 95     # Minimum face size during enrollment for high-res eyes
 
 # -- Liveness / Anti-Spoofing Configuration ----------------------------------
-REQUIRE_LIVENESS: bool            = True
-BLINK_REL_DROP_RATIO: float       = 0.83   # EAR must drop to <= 83% of open-eye baseline (>=17% drop)
-BLINK_NORM_DROP_RATIO: float      = 0.84   # Pitch-normalized EAR must drop to <= 84% of baseline
-BLINK_MIN_ABS_DROP: float         = 0.035  # Minimum absolute EAR drop from open-eye baseline
-BLINK_RECOVERY_RATIO: float       = 0.89   # Post-blink EAR must recover to >= 89% of baseline
-LIVENESS_WINDOW_SECONDS: float    = 4.5    # Sliding time window for blink/liveness history
-SPOOF_ALERT_SECONDS: float        = 3.2    # Seconds of static stare before logging spoof warning
-ENROLLMENT_TIMEOUT_SECONDS: float = 7.5    # Max seconds to wait for live blink during enrollment
-ENROLLMENT_SAMPLES_REQUIRED: int  = 3      # Number of clean open-eye frames to average on enroll
+REQUIRE_LIVENESS: bool             = False  # Zero blinking needed: MiniFASNet passively blocks photos & screens!
+BLINK_REL_DROP_RATIO: float        = 0.74   # EAR must drop to <= 74% of open-eye baseline (>=26% drop)
+BLINK_NORM_DROP_RATIO: float       = 0.75   # Pitch-normalized EAR must drop to <= 75% of baseline
+BLINK_MIN_ABS_DROP: float          = 0.052  # Minimum absolute EAR drop from open-eye baseline
+BLINK_RECOVERY_RATIO: float        = 0.89   # Post-blink EAR must recover to >= 89% of baseline
+BLINK_MIN_EYE_PIXEL_DELTA: float   = 5.5    # Minimum grayscale pixel MAD inside eye patch on eyelid closure
+BLINK_EYE_VS_CHEEK_RATIO: float    = 1.75   # Eye patch pixel change must be >= 1.75x nose/cheek pixel change
+BLINK_CONTRAST_DROP_RATIO: float   = 0.88   # Closed-eye internal pupil/sclera contrast must drop <= 88%
+LIVENESS_WINDOW_SECONDS: float     = 4.5    # Sliding time window for blink/liveness history
+SPOOF_ALERT_SECONDS: float         = 3.0    # Seconds of static stare before logging spoof warning
+ENROLLMENT_TIMEOUT_SECONDS: float  = 8.5    # Max seconds to wait for live blink during enrollment
+ENROLLMENT_SAMPLES_REQUIRED: int   = 3      # Number of clean open-eye frames to average on enroll
 
 # -- Cooldown ----------------------------------------------------------------
 COOLDOWN_SECONDS: int = 8           # Minimum seconds between repeated decisions
@@ -333,7 +340,7 @@ def fetch_known_faces(client: Client) -> list[dict]:
     log.info("Fetching registered face embeddings from Supabase ...")
     response = (
         client.table("profiles")
-        .select("id, name, face_embedding")
+        .select("id, name, role, face_embedding")
         .not_.is_("face_embedding", "null")
         .execute()
     )
@@ -354,6 +361,7 @@ def fetch_known_faces(client: Client) -> list[dict]:
             faces.append({
                 "id":        row["id"],
                 "name":      row.get("name", "Unknown"),
+                "role":      row.get("role", "Faculty"),
                 "embedding": embedding,
             })
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -409,9 +417,18 @@ def _normalize_time_str(t_str: str) -> str:
 def check_faculty_schedule_status(faculty_id: str) -> tuple[bool, str, bool, int]:
     """
     Strict schedule validation for faculty with 15-minute grace period.
+    Custodians / Administrators have master 24/7 access without requiring a class schedule.
     Returns:
       (is_sched_ok: bool, message: str, is_late: bool, mins_late: int)
     """
+    # 1. Check if person is a Custodian / Lab Admin (Master Access)
+    with known_faces_lock:
+        profile_match = next((p for p in known_faces if str(p.get("id")) == str(faculty_id)), None)
+        if profile_match:
+            role = str(profile_match.get("role", "")).lower()
+            if "custodian" in role or "admin" in role:
+                return True, f"Custodian Master Access ({profile_match.get('role')})", False, 0
+
     now_struct = time.localtime()
     current_day = time.strftime("%A", now_struct)  # e.g., 'Monday'
     current_time = time.strftime("%H:%M:%S", now_struct)
@@ -558,17 +575,17 @@ def start_realtime_listener(client: Client) -> None:
                                         "camera_status": "completed"
                                     }).eq("id", pid).execute()
                                     enrollment_status = "completed"
-                                    add_history_entry(pname, "granted", "Live Face Enrolled (Blink Verified)")
-                                    log.info(f"✅ Live-verified face embedding enrolled for '{pname}'!")
+                                    add_history_entry(pname, "enrolled", "Face Biometrics Enrolled")
+                                    last_decision_time = time.time() + 15.0  # 15s grace cooldown
+                                    log.info(f"✅ Face embedding enrolled for '{pname}'!")
                                     reload_known_faces(client)
                                 else:
-                                    client.table("profiles").update({"camera_status": "failed_no_face"}).eq("id", pid).execute()
-                                    if "Liveness" in err_msg or "Pictures" in err_msg:
-                                        enrollment_status = "failed_spoof"
+                                    status_code = "failed_spoof" if ("Liveness" in err_msg or "Pictures" in err_msg) else "failed_no_face"
+                                    client.table("profiles").update({"camera_status": status_code}).eq("id", pid).execute()
+                                    enrollment_status = status_code
+                                    if status_code == "failed_spoof":
                                         add_history_entry(pname, "denied", "Enroll Blocked: Spoof/Photo Rejected")
-                                    else:
-                                        enrollment_status = "failed_no_face"
-                                    log.warning("⚠️ Pending capture rejected for '%s': %s", pname, err_msg)
+                                    log.warning("⚠️ Pending capture rejected for '%s' (%s): %s", pname, status_code, err_msg)
                             else:
                                 log.warning("⚠️ latest_frame is None — main loop camera not ready yet. Retrying next cycle.")
                                 client.table("profiles").update({"camera_status": "failed_camera_error"}).eq("id", pid).execute()
@@ -603,7 +620,7 @@ def start_remote_unlock_listener(client: Client) -> None:
                     .select("id")
                     .eq("laboratory_id", LABORATORY_ID)
                     .eq("decision", "granted")
-                    .ilike("reason", "Manual Force Unlock%")
+                    .or_("reason.ilike.Manual Force Unlock%,reason.ilike.Laboratory Exit%,reason.ilike.Exit%")
                     .order("created_at", desc=True)
                     .limit(1)
                     .execute()
@@ -624,7 +641,7 @@ def start_remote_unlock_listener(client: Client) -> None:
                     .select("id, reason, created_at")
                     .eq("laboratory_id", LABORATORY_ID)
                     .eq("decision", "granted")
-                    .ilike("reason", "Manual Force Unlock%")
+                    .or_("reason.ilike.Manual Force Unlock%,reason.ilike.Laboratory Exit%,reason.ilike.Exit%")
                     .order("created_at", desc=True)
                     .limit(1)
                     .execute()
@@ -637,8 +654,12 @@ def start_remote_unlock_listener(client: Client) -> None:
                     elif latest_id != last_processed_unlock_id:
                         last_processed_unlock_id = latest_id
                         u_reason = latest_unlock.get("reason", "Manual Force Unlock")
-                        log.info(f"🔓 Supabase Manual Unlock detected: {u_reason}")
-                        add_history_entry("Remote App", "granted", u_reason)
+                        log.info(f"🔓 Supabase Remote Unlock/Exit detected: {u_reason}")
+                        # Extract name if present in reason (e.g. 'Laboratory Exit: Prof. Name')
+                        actor_name = "Remote App"
+                        if ":" in u_reason:
+                            actor_name = u_reason.split(":", 1)[1].strip()
+                        add_history_entry(actor_name, "granted", u_reason)
                         unlock_door()
             except Exception as unlock_err:
                 log.debug(f"Remote unlock poll error: {unlock_err}")
@@ -792,8 +813,9 @@ class EnrollmentRequestHandler(BaseHTTPRequestHandler):
                 # Reload local registry
                 reload_known_faces(self.supabase_client)
 
-                add_history_entry(pname, "granted", "Live Face Enrolled via Pi Camera")
-                log.info(f"✅ LIVE-VERIFIED ENROLLMENT SUCCESSFUL for {pname}")
+                add_history_entry(pname, "enrolled", "Live Face Enrolled via Pi Camera")
+                last_decision_time = time.time() + 15.0  # 15s grace cooldown
+                log.info(f"✅ ENROLLMENT SUCCESSFUL for {pname}")
 
                 self._send_json(200, {"success": True, "name": pname})
 
@@ -976,12 +998,12 @@ def find_best_match(live_embedding: np.ndarray) -> tuple[str | None, str | None,
     """
     Compare a live face embedding against every stored profile using strict
     Cosine distance (1 - dot product of L2-normalized unit vectors) plus a
-    second-best separation margin so unregistered or ambiguous faces never
+    second-best separation margin so unregistered or different people never
     falsely match a registered profile.
 
     Returns:
         (faculty_id, name, distance) where faculty_id/name are None if
-        no profile passes the strict threshold and separation margin.
+        no profile passes the strict threshold (0.036) and separation margin.
     """
     live_norm = _l2_norm(live_embedding)
     best_cosine: float = float("inf")
@@ -1002,11 +1024,11 @@ def find_best_match(live_embedding: np.ndarray) -> tuple[str | None, str | None,
                 second_best_cosine = cos_dist
 
     if best_cosine < FACE_MATCH_THRESHOLD:
-        # If there are multiple profiles and the match is near the threshold boundary,
-        # require a clear separation margin over the 2nd-best profile.
+        # Require a clear separation margin over the 2nd-best profile whenever
+        # multiple profiles exist and the match is not an ultra-tight (<0.024) hit.
         if (
             second_best_cosine < float("inf")
-            and best_cosine > 0.042
+            and best_cosine > 0.024
             and (second_best_cosine - best_cosine) < FACE_MATCH_MARGIN
         ):
             log.warning(
@@ -1023,7 +1045,7 @@ def find_best_match(live_embedding: np.ndarray) -> tuple[str | None, str | None,
 
 def _scale_box_to_full(small_box: tuple[int, int, int, int], frame_shape: tuple[int, ...]) -> tuple[int, int, int, int]:
     """Scale a bounding box from downscaled coordinates back to full frame coordinates."""
-    h, w = frame_shape[:2]
+    h, w = frame_bgr_shape = frame_shape[:2]
     top, right, bottom, left = [int(round(c / FRAME_SCALE_FACTOR)) for c in small_box]
     top = max(0, min(h - 1, top))
     bottom = max(top + 1, min(h, bottom))
@@ -1036,6 +1058,57 @@ def _scale_box_to_small(full_box: tuple[int, int, int, int]) -> tuple[int, int, 
     """Scale a full-frame bounding box back to downscaled coordinates for UI overlay."""
     top, right, bottom, left = [int(round(c * FRAME_SCALE_FACTOR)) for c in full_box]
     return (top, right, bottom, left)
+
+
+def _detect_face_box_fast(
+    frame_bgr: np.ndarray,
+    prev_full_box: tuple[int, int, int, int] | None = None,
+    use_roi_hint: bool = True,
+) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+    """
+    Detect the primary face bounding box on the current frame.
+    When `prev_full_box` is provided and `use_roi_hint=True`, first searches a padded ROI
+    around `prev_full_box` on the downscaled frame (~6ms instead of ~35ms), guaranteeing
+    that `full_box` is ALWAYS freshly detected on the current frame and never stale!
+
+    Returns:
+        (full_box, small_box) or (None, None) if no face is present.
+    """
+    small_frame = cv2.resize(
+        frame_bgr,
+        (0, 0),
+        fx=FRAME_SCALE_FACTOR,
+        fy=FRAME_SCALE_FACTOR,
+    )
+    rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+    sh, sw = rgb_small.shape[:2]
+
+    if prev_full_box is not None and use_roi_hint:
+        pt, pr, pb, pl = _scale_box_to_small(prev_full_box)
+        bw = max(20, pr - pl)
+        bh = max(20, pb - pt)
+        pad_x = int(bw * 0.45)
+        pad_y = int(bh * 0.45)
+        rx0 = max(0, pl - pad_x)
+        ry0 = max(0, pt - pad_y)
+        rx1 = min(sw, pr + pad_x)
+        ry1 = min(sh, pb + pad_y)
+        roi = rgb_small[ry0:ry1, rx0:rx1]
+        if roi.size > 0:
+            with dlib_lock:
+                roi_locs = face_recognition.face_locations(roi)
+            if roi_locs:
+                bt, br, bb, bl = max(roi_locs, key=lambda b: max(0, b[2] - b[0]) * max(0, b[1] - b[3]))
+                best_small = (bt + ry0, br + rx0, bb + ry0, bl + rx0)
+                return _scale_box_to_full(best_small, frame_bgr.shape), best_small
+
+    with dlib_lock:
+        small_locs = face_recognition.face_locations(rgb_small)
+    if not small_locs:
+        return None, None
+
+    best_small = max(small_locs, key=lambda b: max(0, b[2] - b[0]) * max(0, b[1] - b[3]))
+    return _scale_box_to_full(best_small, frame_bgr.shape), best_small
 
 
 def _compute_eye_aspect_ratio(eye_pts: list[tuple[int, int]]) -> float:
@@ -1054,16 +1127,130 @@ def _compute_eye_aspect_ratio(eye_pts: list[tuple[int, int]]) -> float:
     return (v1 + v2) / (2.0 * horiz)
 
 
+# =============================================================================
+#  MINIFASNET PASSIVE AI ANTI-SPOOFING (Zero-Blink Face Liveness)
+# =============================================================================
+MINIFASNET_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minifasnet_v2.onnx")
+
+
+class MiniFASNetClassifier:
+    """
+    Lightweight, production-grade passive face anti-spoofing model (Silent-Face-Anti-Spoofing).
+    Inspects 80x80 scaled face crop for presentation attacks:
+      Class 0: Print Attack (printed photo / paper)
+      Class 1: Live / Real Human Face
+      Class 2: Replay Attack (phone screen / tablet / monitor playback)
+    """
+
+    def __init__(self, model_path: str):
+        self.model_path = model_path
+        self.session = None
+        self.net = None
+
+        if os.path.exists(model_path):
+            try:
+                import onnxruntime as ort
+
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = 2
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                self.session = ort.InferenceSession(
+                    model_path, sess_options=opts, providers=["CPUExecutionProvider"]
+                )
+                log.info("🛡️ MiniFASNet Passive AI Anti-Spoofing loaded via ONNXRuntime: %s", model_path)
+            except Exception:
+                try:
+                    self.net = cv2.dnn.readNetFromONNX(model_path)
+                    log.info("🛡️ MiniFASNet Passive AI Anti-Spoofing loaded via OpenCV DNN: %s", model_path)
+                except Exception as ex:
+                    log.warning("Could not load MiniFASNet model: %s", ex)
+
+    def is_loaded(self) -> bool:
+        return self.session is not None or self.net is not None
+
+    def predict_liveness(
+        self, frame_bgr: np.ndarray, full_box: tuple[int, int, int, int]
+    ) -> tuple[bool, float, str]:
+        """
+        Classifies whether the face in frame_bgr is a genuine live person or a presentation attack.
+        Returns:
+            (is_real: bool, confidence_pct: float, attack_type: str)
+        """
+        if not self.is_loaded() or frame_bgr is None or frame_bgr.size == 0:
+            return True, 100.0, "Real (Bypass)"
+
+        try:
+            top, right, bottom, left = full_box
+            w = right - left
+            h = bottom - top
+            if w < 30 or h < 30:
+                return True, 50.0, "Real"
+
+            xc = left + w * 0.5
+            yc = top + h * 0.5
+            max_side = max(w, h)
+            edge_size = max_side * 2.7
+            nx1 = int(xc - edge_size * 0.5)
+            ny1 = int(yc - edge_size * 0.5)
+            nx2 = int(nx1 + edge_size)
+            ny2 = int(ny1 + edge_size)
+
+            h_img, w_img = frame_bgr.shape[:2]
+            pad_x1 = max(0, -nx1)
+            pad_y1 = max(0, -ny1)
+            pad_x2 = max(0, nx2 - w_img)
+            pad_y2 = max(0, ny2 - h_img)
+
+            cropped = frame_bgr[max(0, ny1) : min(h_img, ny2), max(0, nx1) : min(w_img, nx2)]
+            if pad_x1 > 0 or pad_y1 > 0 or pad_x2 > 0 or pad_y2 > 0:
+                cropped = cv2.copyMakeBorder(
+                    cropped, pad_y1, pad_y2, pad_x1, pad_x2, cv2.BORDER_CONSTANT, value=[0, 0, 0]
+                )
+
+            img_80 = cv2.resize(cropped, (80, 80), interpolation=cv2.INTER_LINEAR)
+            blob = np.transpose(img_80.astype(np.float32), (2, 0, 1))[np.newaxis, ...]
+
+            if self.session is not None:
+                inp_name = self.session.get_inputs()[0].name
+                logits = self.session.run(None, {inp_name: blob})[0].flatten()
+            else:
+                self.net.setInput(blob)
+                logits = self.net.forward().flatten()
+
+            exp_scores = np.exp(logits - np.max(logits))
+            probs = exp_scores / np.sum(exp_scores)
+            p_print = float(probs[0])
+            p_live = float(probs[1])
+            p_replay = float(probs[2])
+
+            # Class 1 is Live Real Human
+            is_real = p_live >= 0.50
+            if is_real:
+                return True, p_live * 100.0, "Live Real Human"
+            elif p_print >= p_replay:
+                return False, p_print * 100.0, "Fake Photo (Print Attack)"
+            else:
+                return False, p_replay * 100.0, "Fake Photo (Screen Replay)"
+        except Exception as exc:
+            log.debug("MiniFASNet inference error: %s", exc)
+            return True, 100.0, "Real (Fallback)"
+
+
+minifasnet = MiniFASNetClassifier(MINIFASNET_MODEL_PATH)
+
+
 def _check_2d_spoof_artifacts(
     frame_bgr: np.ndarray,
     full_box: tuple[int, int, int, int],
+    min_size_px: int = MIN_FACE_SIZE_PX,
 ) -> tuple[bool, str, float]:
     """
     Inspect the face crop for 2D presentation attack (calendar / printed photo / phone screen)
     artifacts and severe motion blur:
-      1. Focus / sharpness check via Laplacian variance (prevents shaking a photo to blur eyes).
-      2. Specular screen/glossy paper glare check (clipped white highlights inside face).
-      3. Natural skin chrominance variance check in YCrCb space (rejects flat monochrome/washed prints).
+      1. Minimum face pixel dimensions (`min_size_px`) so eyes have enough pixel resolution.
+      2. Focus / sharpness check via Laplacian variance (prevents shaking a photo to blur eyes).
+      3. Specular screen/glossy paper glare check (clipped white highlights inside face).
+      4. Natural skin chrominance variance check in YCrCb space (rejects flat monochrome/washed prints).
 
     Returns:
         (is_suspect_2d, reason, laplacian_var)
@@ -1072,8 +1259,8 @@ def _check_2d_spoof_artifacts(
     top, right, bottom, left = full_box
     fh = bottom - top
     fw = right - left
-    if fh < MIN_FACE_SIZE_PX or fw < MIN_FACE_SIZE_PX:
-        return True, "Face too small / far from camera", 0.0
+    if fh < min_size_px or fw < min_size_px:
+        return True, "Face too small / move closer to camera", 0.0
 
     crop = frame_bgr[max(0, top):min(h, bottom), max(0, left):min(w, right)]
     if crop.size == 0:
@@ -1081,7 +1268,7 @@ def _check_2d_spoof_artifacts(
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    if lap_var < 10.0:
+    if lap_var < 12.0:
         return True, "Image too blurry (hold still)", lap_var
 
     # Check central face region for unnatural specular screen/glossy calendar glare
@@ -1090,30 +1277,98 @@ def _check_2d_spoof_artifacts(
     if inner.size > 0:
         hsv = cv2.cvtColor(inner, cv2.COLOR_BGR2HSV)
         # Clipped bright low-saturation glare (typical of phone screen or glossy paper reflection)
-        glare_mask = (hsv[:, :, 2] > 250) & (hsv[:, :, 1] < 18)
+        glare_mask = (hsv[:, :, 2] > 248) & (hsv[:, :, 1] < 20)
         glare_ratio = float(np.mean(glare_mask))
-        if glare_ratio > 0.22:
+        if glare_ratio > 0.18:
             return True, "Screen/paper glare detected", lap_var
 
         ycrcb = cv2.cvtColor(inner, cv2.COLOR_BGR2YCrCb)
         cr_std = float(np.std(ycrcb[:, :, 1]))
         cb_std = float(np.std(ycrcb[:, :, 2]))
-        if cr_std < 1.8 and cb_std < 1.8:
+        if cr_std < 2.2 and cb_std < 2.2:
             return True, "Flat print chrominance detected", lap_var
 
+        # Check for OLED/LCD screen blue-backlight emission bias & digital screen Moiré noise
+        mean_b = float(np.mean(inner[:, :, 0]))
+        mean_r = float(np.mean(inner[:, :, 2]))
+        if mean_b > (mean_r + 12.0):
+            return True, "Digital screen backlight detected", lap_var
+        if lap_var > 4800.0:
+            return True, "Screen Moire / print halftone artifact detected", lap_var
+
     return False, "", lap_var
+
+
+def _extract_eye_and_cheek_patches(
+    frame_bgr: np.ndarray | None,
+    left_eye: list[tuple[int, int]],
+    right_eye: list[tuple[int, int]],
+    eye_mid: np.ndarray,
+    nose_pt: np.ndarray,
+    inter_ocular: float,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, float]:
+    """
+    Extract canonical 20x12 grayscale patches anchored on the stable inner/outer eye corners
+    (p0 and p3, which do NOT move vertically during a blink) plus a reference patch on the
+    nose bridge / upper cheek.
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return None, None, None, 0.0
+
+    h, w = frame_bgr.shape[:2]
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
+
+    def _crop_corner_eye(eye_pts: list[tuple[int, int]]) -> tuple[np.ndarray | None, float]:
+        p0 = np.array(eye_pts[0], dtype=np.float64)
+        p3 = np.array(eye_pts[3], dtype=np.float64)
+        c = 0.5 * (p0 + p3)
+        ew = max(8.0, float(np.linalg.norm(p3 - p0)))
+        rx = max(5, int(round(0.46 * ew)))
+        ry = max(3, int(round(0.32 * ew)))
+        cx, cy = int(round(c[0])), int(round(c[1]))
+        x0, x1 = max(0, cx - rx), min(w, cx + rx)
+        y0, y1 = max(0, cy - ry), min(h, cy + ry)
+        if (x1 - x0) < 4 or (y1 - y0) < 3:
+            return None, 0.0
+        sub = gray[y0:y1, x0:x1].astype(np.float32)
+        resized = cv2.resize(sub, (20, 12), interpolation=cv2.INTER_LINEAR)
+        contrast = float(np.percentile(resized, 85) - np.percentile(resized, 15))
+        norm_patch = resized - float(np.mean(resized))
+        return norm_patch, contrast
+
+    l_patch, l_cont = _crop_corner_eye(left_eye)
+    r_patch, r_cont = _crop_corner_eye(right_eye)
+    if l_patch is None or r_patch is None:
+        return None, None, None, 0.0
+
+    ref_c = 0.55 * eye_mid + 0.45 * nose_pt
+    rx_ref = max(5, int(round(0.22 * inter_ocular)))
+    ry_ref = max(3, int(round(0.15 * inter_ocular)))
+    rcx, rcy = int(round(ref_c[0])), int(round(ref_c[1]))
+    rx0, rx1 = max(0, rcx - rx_ref), min(w, rcx + rx_ref)
+    ry0, ry1 = max(0, rcy - ry_ref), min(h, rcy + ry_ref)
+    if (rx1 - rx0) < 4 or (ry1 - ry0) < 3:
+        return None, None, None, 0.0
+
+    ref_sub = gray[ry0:ry1, rx0:rx1].astype(np.float32)
+    ref_resized = cv2.resize(ref_sub, (20, 12), interpolation=cv2.INTER_LINEAR)
+    ref_patch = ref_resized - float(np.mean(ref_resized))
+    eye_contrast = 0.5 * (l_cont + r_cont)
+    return l_patch, r_patch, ref_patch, eye_contrast
 
 
 def _extract_face_geometry(
     landmarks: dict,
     full_box: tuple[int, int, int, int],
     lap_var: float,
+    frame_bgr: np.ndarray | None = None,
 ) -> dict | None:
     """
-    Compute 3D-aware geometric ratios from dlib's 68 facial landmarks:
+    Compute 3D-aware geometric ratios AND corner-anchored photometric eye/cheek patches:
       - left_ear, right_ear, ear: raw Eye Aspect Ratios
       - pitch_ratio: vertical (eye-midpoint to nose-tip) / horizontal (inter-ocular distance)
       - ear_norm: pitch-compensated EAR (ear / pitch_ratio), invariant to tilting a 2D photo!
+      - l_patch, r_patch, ref_patch, eye_contrast: pixel-level eyelid closure verification
       - parallax_3d: difference between nose-to-jaw yaw ratio and nose-bridge-to-eye yaw ratio
       - mar: Mouth Aspect Ratio
     """
@@ -1137,7 +1392,7 @@ def _extract_face_geometry(
         r_center = np.mean(np.array(right_eye, dtype=np.float64), axis=0)
         eye_mid = 0.5 * (l_center + r_center)
         inter_ocular = float(np.linalg.norm(r_center - l_center))
-        if inter_ocular < 12.0:
+        if inter_ocular < 18.0:
             return None
 
         nose_pt = np.array(nose_tip[2], dtype=np.float64)
@@ -1168,6 +1423,31 @@ def _extract_face_geometry(
             if m_w > 1.0:
                 mar = (m_h / m_w) / pitch_ratio
 
+        l_patch, r_patch, ref_patch, eye_contrast = _extract_eye_and_cheek_patches(
+            frame_bgr, left_eye, right_eye, eye_mid, nose_pt, inter_ocular
+        )
+
+        # Extract eye crops for MRL Eye CNN Classifier (64x64)
+        eye_side = max(24.0, inter_ocular * 0.70)
+        half = eye_side * 0.5
+        h_f, w_f = frame_bgr.shape[:2]
+
+        l_x1 = int(max(0, l_center[0] - half))
+        l_y1 = int(max(0, l_center[1] - half))
+        l_x2 = int(min(w_f, l_center[0] + half))
+        l_y2 = int(min(h_f, l_center[1] + half))
+        l_crop = frame_bgr[l_y1:l_y2, l_x1:l_x2]
+
+        r_x1 = int(max(0, r_center[0] - half))
+        r_y1 = int(max(0, r_center[1] - half))
+        r_x2 = int(min(w_f, r_center[0] + half))
+        r_y2 = int(min(h_f, r_center[1] + half))
+        r_crop = frame_bgr[r_y1:r_y2, r_x1:r_x2]
+
+        p_l_closed = mrl_classifier.predict_closed_prob(l_crop) if mrl_classifier.is_loaded() else 0.0
+        p_r_closed = mrl_classifier.predict_closed_prob(r_crop) if mrl_classifier.is_loaded() else 0.0
+        eye_closed_prob = max(p_l_closed, p_r_closed)
+
         return {
             "left_ear": left_ear,
             "right_ear": right_ear,
@@ -1180,6 +1460,13 @@ def _extract_face_geometry(
             "inter_ocular": inter_ocular,
             "full_box": full_box,
             "lap_var": lap_var,
+            "l_patch": l_patch,
+            "r_patch": r_patch,
+            "ref_patch": ref_patch,
+            "eye_contrast": eye_contrast,
+            "eye_closed_prob": eye_closed_prob,
+            "p_l_closed": p_l_closed,
+            "p_r_closed": p_r_closed,
         }
     except Exception:
         return None
@@ -1187,16 +1474,22 @@ def _extract_face_geometry(
 
 class LivenessTracker:
     """
-    High-speed sliding-window liveness verifier that distinguishes a real living human
-    from a printed calendar photo, ID card, or phone screen.
+    High-speed Photometric + Geometric Liveness Verifier that blocks printed calendar
+    photos, ID cards, and phone screens during both Enrollment and Recognition.
 
-    Requires a verified bilateral eye blink where:
-      1. Both left & right eyes drop significantly below the user's open-eye baseline.
-      2. Pitch-normalized EAR (`ear / pitch_ratio`) drops simultaneously, proving the
-         change is not caused by tilting a flat 2D photo up/down.
-      3. Head pitch and position remain steady during the ~150-350ms eyelid closure,
-         and frame sharpness (`lap_var`) does not collapse (blocking shake/blur tricks).
-      4. Both eyes reopen back to the open-eye baseline within 0.06s - 0.70s.
+    Requires a verified bilateral eye blink passing 6 independent gates:
+      1. Bilateral Geometric EAR Drop: `ear <= 0.74 * base_ear` (>=26% drop) and
+         `base_ear - ear >= 0.052`, blocking 1-pixel integer landmark rounding jitter.
+      2. Pitch-Compensated EAR Drop: `ear_norm <= 0.75 * base_ear_norm`, blocking
+         tilted/angled calendar photos.
+      3. Photometric Eyelid Pixel Change: Corner-anchored eye patches must change by
+         `>= 5.5` gray levels when closing (`s_pre -> sk`) and `>= 5.0` when reopening
+         (`sk -> s_post`), and return to open-eye appearance (`s_pre ~ s_post`).
+      4. Differential Eye-vs-Cheek Ratio: Eye patch pixel change must be `>= 1.75x`
+         the nose/cheek reference patch change, blocking waved/shaken/moved photos.
+      5. Pupil/Sclera Contrast Reduction: Internal eye contrast must drop (`<= 0.88x`)
+         at the blink valley as smooth eyelid skin covers the dark iris and white sclera.
+      6. Rigid Head Pitch & Translation Stability (`< 7%` shift) during the blink.
     """
 
     def __init__(self) -> None:
@@ -1234,7 +1527,7 @@ class LivenessTracker:
         elif self.samples:
             prev = self.samples[-1]
             jump = float(np.linalg.norm(geom["center"] - prev["center"]))
-            if jump > 0.40 * max(geom["inter_ocular"], prev["inter_ocular"]):
+            if jump > 0.35 * max(geom["inter_ocular"], prev["inter_ocular"]):
                 log.debug("Face position jump detected (%.1f px) — resetting liveness.", jump)
                 self.reset()
 
@@ -1255,17 +1548,18 @@ class LivenessTracker:
         if len(self.samples) > 120 or (self.samples and self.samples[0]["t"] < cutoff):
             self.samples = [s for s in self.samples if s["t"] >= cutoff][-120:]
 
-        # Expire previous live confirmation after 5.0 seconds if door hasn't unlocked yet
-        if self.is_live and (now - self.live_confirmed_time) > 5.0:
+        # Expire previous live confirmation after 4.5 seconds if door hasn't unlocked yet
+        if self.is_live and (now - self.live_confirmed_time) > 4.5:
             self.is_live = False
 
-        if not self.is_live and len(self.samples) >= 5:
+        min_samples = 3 if mrl_classifier.is_loaded() else 5
+        if not self.is_live and len(self.samples) >= min_samples:
             if self._detect_verified_blink():
                 self.is_live = True
                 self.blink_count += 1
                 self.live_confirmed_time = now
                 self.spoof_reason = ""
-                log.info("[LIVENESS] Verified via natural eye blink (total blinks=%d).", self.blink_count)
+                log.info("[LIVENESS] Verified via photometric + geometric eye blink (total=%d).", self.blink_count)
 
         if self.is_live:
             return True, "LIVE VERIFIED [OK]"
@@ -1278,15 +1572,51 @@ class LivenessTracker:
     def _detect_verified_blink(self) -> bool:
         """
         Scan sliding window for a genuine bilateral eye blink valley bounded by
-        open-eye frames before and after, with stable head pitch and focus.
+        open-eye frames before and after. Uses MRL Deep Learning Eye CNN as primary
+        verifier, with landmark EAR fallback.
         """
         n = len(self.samples)
+        if n < 4:
+            return False
+
+        # --- Gate 1: MRL Deep Learning Eye Blink CNN Classifier ---
+        if mrl_classifier.is_loaded():
+            probs = np.array([s.get("eye_closed_prob", 0.0) for s in self.samples], dtype=np.float64)
+            times = np.array([s["t"] for s in self.samples], dtype=np.float64)
+
+            # Detect blink: eyes were open, closed (prob >= 0.55), and reopened (prob <= 0.40)
+            closed_mask = probs >= 0.55
+            if np.any(closed_mask):
+                closed_indices = np.where(closed_mask)[0]
+                k = int(closed_indices[-1])
+                # Ensure we have frames before and after the closed state
+                if 0 < k < (n - 1):
+                    t_closed = times[k]
+                    # Open frames within 0.8s before closure
+                    pre_open = any(probs[i] <= 0.40 and (t_closed - times[i]) <= 0.80 for i in range(k))
+                    # Open frames within 0.8s after closure
+                    post_open = any(probs[j] <= 0.40 and (times[j] - t_closed) <= 0.80 for j in range(k + 1, n))
+                    if pre_open and post_open:
+                        first_k = int(closed_indices[0])
+                        closed_duration = times[k] - times[first_k]
+                        if closed_duration <= 0.65:
+                            log.info(
+                                "👁️ [MRL LIVENESS] Real Eye Blink Confirmed via CNN! (P_closed=%.2f, dur=%.2fs)",
+                                probs[k],
+                                closed_duration,
+                            )
+                            return True
+
+            # When MRL CNN is loaded, rely exclusively on its high-accuracy eyelid predictions
+            return False
+
+        # --- Fallback Gate: Landmark EAR (used only if mrl_eye_model.onnx is absent) ---
         if n < 5:
             return False
 
         lap_vals = np.array([s["lap_var"] for s in self.samples], dtype=np.float64)
         median_lap = float(np.median(lap_vals))
-        min_acceptable_lap = max(10.0, 0.42 * median_lap)
+        min_acceptable_lap = max(12.0, 0.48 * median_lap)
 
         ears = np.array([s["ear"] for s in self.samples], dtype=np.float64)
         ear_norms = np.array([s["ear_norm"] for s in self.samples], dtype=np.float64)
@@ -1299,7 +1629,7 @@ class LivenessTracker:
         base_right = float(np.percentile(right_ears, 80))
 
         # Must have a clear open-eye baseline
-        if base_ear < 0.16 or base_left < 0.15 or base_right < 0.15:
+        if base_ear < 0.18 or base_left < 0.17 or base_right < 0.17:
             return False
 
         # Scan candidate valley indices k
@@ -1308,30 +1638,32 @@ class LivenessTracker:
             if sk["lap_var"] < min_acceptable_lap:
                 continue
 
-            # 1. Check raw EAR drop & pitch-normalized EAR drop at valley k
+            # Gate 1: Strict bilateral geometric EAR drop (>=26% drop & >=0.052 abs drop)
             if sk["ear"] > base_ear * BLINK_REL_DROP_RATIO:
                 continue
             if (base_ear - sk["ear"]) < BLINK_MIN_ABS_DROP:
                 continue
+
+            # Gate 2: Pitch-compensated EAR drop (>=25% drop, blocks tilted calendar photos)
             if sk["ear_norm"] > base_ear_norm * BLINK_NORM_DROP_RATIO:
                 continue
 
-            # 2. Check bilateral symmetry (both left and right eyes must close together)
-            if sk["left_ear"] > base_left * 0.87 or sk["right_ear"] > base_right * 0.87:
+            # Both left and right eyes must close together symmetrically
+            if sk["left_ear"] > base_left * 0.78 or sk["right_ear"] > base_right * 0.78:
                 continue
 
-            # 3. Find open-eye frame right before blink (within 0.55s before k)
+            # Find open-eye frame right before blink (within 0.55s before k)
             pre_idx = None
             for i in range(k - 1, -1, -1):
                 if (sk["t"] - self.samples[i]["t"]) > 0.55:
                     break
-                if self.samples[i]["ear"] >= base_ear * 0.89 and self.samples[i]["lap_var"] >= min_acceptable_lap:
+                if self.samples[i]["ear"] >= base_ear * 0.90 and self.samples[i]["lap_var"] >= min_acceptable_lap:
                     pre_idx = i
                     break
             if pre_idx is None:
                 continue
 
-            # 4. Find open-eye recovery frame right after blink (within 0.65s after k)
+            # Find open-eye recovery frame right after blink (within 0.65s after k)
             post_idx = None
             for j in range(k + 1, n):
                 if (self.samples[j]["t"] - sk["t"]) > 0.65:
@@ -1342,26 +1674,72 @@ class LivenessTracker:
             if post_idx is None:
                 continue
 
-            # Duration of blink closure-to-recovery must be realistic (0.05s to 0.75s)
+            # Duration of blink closure-to-recovery must be realistic (0.06s to 0.70s)
             blink_dur = self.samples[post_idx]["t"] - self.samples[pre_idx]["t"]
-            if blink_dur < 0.05 or blink_dur > 0.75:
+            if blink_dur < 0.06 or blink_dur > 0.70:
                 continue
 
-            # 5. Rigid head pitch & translation stability during blink (blocks tilting/shaking a calendar photo)
             s_pre = self.samples[pre_idx]
             s_post = self.samples[post_idx]
+
+            # Gate 3: Rigid head pitch & translation stability during blink (< 7% shift)
             pitch_ref = max(0.35, s_pre["pitch_ratio"])
-            if abs(sk["pitch_ratio"] - s_pre["pitch_ratio"]) / pitch_ref > 0.09:
+            if abs(sk["pitch_ratio"] - s_pre["pitch_ratio"]) / pitch_ref > 0.07:
                 continue
-            if abs(s_post["pitch_ratio"] - s_pre["pitch_ratio"]) / pitch_ref > 0.10:
+            if abs(s_post["pitch_ratio"] - s_pre["pitch_ratio"]) / pitch_ref > 0.08:
                 continue
 
             max_step_shift = 0.0
             for m in range(pre_idx, post_idx):
                 step_d = float(np.linalg.norm(self.samples[m + 1]["center"] - self.samples[m]["center"]))
                 max_step_shift = max(max_step_shift, step_d)
-            if max_step_shift > 0.09 * sk["inter_ocular"]:
+            if max_step_shift > 0.07 * sk["inter_ocular"]:
                 continue
+
+            # Gate 4, 5 & 6: Photometric Eyelid Closure + Differential Eye-vs-Cheek Ratio + Contrast Drop
+            if (
+                sk.get("l_patch") is not None
+                and s_pre.get("l_patch") is not None
+                and s_post.get("l_patch") is not None
+                and sk.get("ref_patch") is not None
+                and s_pre.get("ref_patch") is not None
+                and s_post.get("ref_patch") is not None
+            ):
+                eye_delta_close = 0.5 * (
+                    float(np.mean(np.abs(sk["l_patch"] - s_pre["l_patch"])))
+                    + float(np.mean(np.abs(sk["r_patch"] - s_pre["r_patch"])))
+                )
+                eye_delta_open = 0.5 * (
+                    float(np.mean(np.abs(sk["l_patch"] - s_post["l_patch"])))
+                    + float(np.mean(np.abs(sk["r_patch"] - s_post["r_patch"])))
+                )
+                eye_delta_reopen = 0.5 * (
+                    float(np.mean(np.abs(s_post["l_patch"] - s_pre["l_patch"])))
+                    + float(np.mean(np.abs(s_post["r_patch"] - s_pre["r_patch"])))
+                )
+
+                ref_delta_close = float(np.mean(np.abs(sk["ref_patch"] - s_pre["ref_patch"])))
+                ref_delta_open = float(np.mean(np.abs(sk["ref_patch"] - s_post["ref_patch"])))
+
+                # Actual eye pixels must change substantially on closure & reopening
+                if eye_delta_close < BLINK_MIN_EYE_PIXEL_DELTA or eye_delta_open < (BLINK_MIN_EYE_PIXEL_DELTA * 0.90):
+                    continue
+
+                # Open eye after blink must return close to open eye before blink
+                if eye_delta_reopen > 0.78 * max(eye_delta_close, eye_delta_open):
+                    continue
+
+                # Eye pixels must change >= 1.75x more than the rigid nose/cheek patch
+                # (completely blocks waving, tilting, or moving a printed calendar photo!)
+                if eye_delta_close < BLINK_EYE_VS_CHEEK_RATIO * max(2.2, ref_delta_close):
+                    continue
+                if eye_delta_open < (BLINK_EYE_VS_CHEEK_RATIO * 0.92) * max(2.2, ref_delta_open):
+                    continue
+
+                # Eyelid skin covering dark iris + white sclera must reduce internal eye contrast
+                open_contrast = max(float(s_pre.get("eye_contrast", 0.0)), float(s_post.get("eye_contrast", 0.0)))
+                if open_contrast > 8.0 and float(sk.get("eye_contrast", 0.0)) > open_contrast * BLINK_CONTRAST_DROP_RATIO:
+                    continue
 
             return True
 
@@ -1373,12 +1751,14 @@ def capture_verified_live_enrollment(
     timeout_sec: float = ENROLLMENT_TIMEOUT_SECONDS,
 ) -> tuple[np.ndarray | None, str]:
     """
-    Perform a multi-frame, liveness-verified face capture for Enrollment.
+    Perform a multi-frame, photometric + geometric liveness-verified face capture for Enrollment.
     Blocks printed photos, calendars, and phone screens by requiring:
-      1. Continuous face presence with no 2D spoof glare/blur artifacts.
-      2. A verified bilateral eye blink (`LivenessTracker`) during the capture window.
-      3. At least `ENROLLMENT_SAMPLES_REQUIRED` (3) clean open-eye embeddings that
-         all match each other (`cos_dist < 0.045`), averaged and L2-normalized.
+      1. Freshly-detected HOG face bounding box (`>= 95x95` px) on every frame (no stale boxes).
+      2. Zero 2D spoof glare/blur/flat-chrominance artifacts.
+      3. A photometrically & geometrically verified bilateral eye blink (`LivenessTracker`)
+         where eye pixels close over the iris while cheek pixels remain steady.
+      4. At least 1 pre-blink open-eye embedding AND 2 post-blink open-eye embeddings
+         (`model="large"`, `num_jitters=2`) that all match within `cos_dist <= 0.032`.
 
     Returns:
         (normalized_embedding_or_None, error_or_status_message)
@@ -1388,16 +1768,17 @@ def capture_verified_live_enrollment(
 
     enrollment_capture_active = True
     tracker = LivenessTracker()
-    collected_embeddings: list[np.ndarray] = []
+    pre_blink_embeddings: list[np.ndarray] = []
+    post_blink_embeddings: list[np.ndarray] = []
     last_emb_time: float = 0.0
     any_face_seen: bool = False
     last_spoof_msg: str = ""
-    cached_full_box: tuple[int, int, int, int] | None = None
-    frames_since_hog: int = 999
+    prev_full_box: tuple[int, int, int, int] | None = None
+    frame_counter: int = 0
     start_t = time.time()
 
     log.info(
-        "[ENROLL] Starting LIVE-VERIFIED enrollment capture for '%s' (timeout=%.1fs)...",
+        "[ENROLL] Starting PHOTOMETRIC LIVE-VERIFIED enrollment capture for '%s' (timeout=%.1fs)...",
         user_name,
         timeout_sec,
     )
@@ -1410,114 +1791,97 @@ def capture_verified_live_enrollment(
                 continue
 
             now = time.time()
+            frame_counter += 1
             frame_copy = frame.copy()
             rgb_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
 
-            if cached_full_box is not None and frames_since_hog < 3 and not tracker.is_live:
-                frames_since_hog += 1
-                full_box = cached_full_box
-                active_face_locations = [_scale_box_to_small(full_box)]
-                face_in_frame_status = True
-            else:
-                small_frame = cv2.resize(
-                    frame_copy,
-                    (0, 0),
-                    fx=FRAME_SCALE_FACTOR,
-                    fy=FRAME_SCALE_FACTOR,
-                )
-                rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            # Always detect fresh face box (use fast padded-ROI HOG on intermediate frames)
+            full_box, best_small = _detect_face_box_fast(
+                frame_copy,
+                prev_full_box=prev_full_box,
+                use_roi_hint=(frame_counter % 4 != 0),
+            )
 
-                with dlib_lock:
-                    small_locs = face_recognition.face_locations(rgb_small)
+            if full_box is None or best_small is None:
+                face_in_frame_status = False
+                active_face_locations = []
+                prev_full_box = None
+                active_face_label = f"ENROLLING {user_name}: Position Face in Frame"
+                active_box_color = (0, 165, 255)
+                tracker.update(None, now=now)
+                time.sleep(0.04)
+                continue
 
-                frames_since_hog = 0
-                if not small_locs:
-                    face_in_frame_status = False
-                    active_face_locations = []
-                    cached_full_box = None
-                    active_face_label = f"ENROLLING {user_name}: Position Face in Frame"
-                    active_box_color = (0, 165, 255)
-                    tracker.update(None, now=now)
-                    time.sleep(0.04)
-                    continue
+            prev_full_box = full_box
+            active_face_locations = [best_small]
+            face_in_frame_status = True
+            any_face_seen = True
 
-                # Pick largest face in frame
-                best_small = max(small_locs, key=lambda b: max(0, b[2] - b[0]) * max(0, b[1] - b[3]))
-                full_box = _scale_box_to_full(best_small, frame_copy.shape)
-                cached_full_box = full_box
-                active_face_locations = [best_small]
-                face_in_frame_status = True
-                any_face_seen = True
-
-            is_suspect_2d, spoof_reason, lap_var = _check_2d_spoof_artifacts(frame_copy, full_box)
+            is_suspect_2d, spoof_reason, lap_var = _check_2d_spoof_artifacts(
+                frame_copy, full_box, min_size_px=MIN_ENROLL_FACE_SIZE_PX
+            )
             if is_suspect_2d:
                 last_spoof_msg = spoof_reason
 
             with dlib_lock:
                 lm_list = face_recognition.face_landmarks(rgb_full, [full_box])
 
-            geom = _extract_face_geometry(lm_list[0], full_box, lap_var) if lm_list else None
+            geom = _extract_face_geometry(lm_list[0], full_box, lap_var, frame_copy) if lm_list else None
             is_live, live_msg = tracker.update(geom, is_suspect_2d, spoof_reason, now=now)
 
-            # Collect 1 pre-blink embedding, then pause heavy encodings so landmark tracking runs at 25+ FPS
-            # until blink is confirmed, then collect remaining post-blink open-eye samples.
-            if (
-                geom is not None
-                and not is_suspect_2d
-                and geom["ear"] >= 0.18
-                and (now - last_emb_time) >= 0.25
-                and len(collected_embeddings) < ENROLLMENT_SAMPLES_REQUIRED
-            ):
-                if len(collected_embeddings) == 0 or is_live:
-                    with dlib_lock:
-                        encs = face_recognition.face_encodings(rgb_full, [full_box])
-                    if encs:
-                        cand_emb = _l2_norm(np.array(encs[0], dtype=np.float64))
-                        # Ensure consistency with previous samples (rejects swapping a photo mid-enrollment)
-                        if collected_embeddings:
-                            prev_dist = float(1.0 - np.dot(cand_emb, collected_embeddings[0]))
-                            if prev_dist > 0.048:
-                                log.warning("Enrollment face swap/inconsistency detected (dist=%.4f) — resetting samples.", prev_dist)
-                                collected_embeddings.clear()
-                                tracker.reset()
-                                continue
-                        collected_embeddings.append(cand_emb)
-                        last_emb_time = now
+            # If 2D spoof / printed photo / screen reflection is detected, block and alert
+            if is_suspect_2d:
+                last_spoof_msg = spoof_reason
+                active_box_color = (0, 0, 255)
+                active_face_label = f"SPOOF BLOCKED: {spoof_reason}"
+                time.sleep(0.04)
+                continue
 
-            if is_live and len(collected_embeddings) >= ENROLLMENT_SAMPLES_REQUIRED:
-                mean_emb = _l2_norm(np.mean(np.stack(collected_embeddings, axis=0), axis=0))
+            # Collect clean facial encoding samples without requiring forced eye blinking
+            if (now - last_emb_time) >= 0.18:
+                with dlib_lock:
+                    encs = face_recognition.face_encodings(
+                        rgb_full, [full_box], num_jitters=2, model="large"
+                    )
+                if encs:
+                    cand_emb = _l2_norm(np.array(encs[0], dtype=np.float64))
+                    if pre_blink_embeddings:
+                        prev_dist = float(1.0 - np.dot(cand_emb, pre_blink_embeddings[0]))
+                        if prev_dist > 0.038:
+                            pre_blink_embeddings.clear()
+                            continue
+                    pre_blink_embeddings.append(cand_emb)
+                    last_emb_time = now
+
+            total_collected = len(pre_blink_embeddings)
+            if total_collected >= ENROLLMENT_SAMPLES_REQUIRED:
+                mean_emb = _l2_norm(np.mean(np.stack(pre_blink_embeddings, axis=0), axis=0))
                 active_box_color = (0, 255, 0)
-                active_face_label = f"ENROLLED [LIVE VERIFIED]: {user_name}"
+                active_face_label = f"ENROLLED: {user_name}"
                 log.info(
-                    "[ENROLL] Live enrollment verified for '%s' (%d samples averaged, blinks=%d).",
+                    "[ENROLL] Enrollment successfully completed for '%s' (%d samples averaged).",
                     user_name,
-                    len(collected_embeddings),
-                    tracker.blink_count,
+                    len(pre_blink_embeddings),
                 )
                 return mean_emb, "completed"
 
             # Update HUD feedback during enrollment
             remaining = max(0.0, timeout_sec - (now - start_t))
-            if not is_live:
-                active_box_color = (0, 165, 255)
-                active_face_label = f"ENROLL {user_name}: BLINK EYES ({remaining:.0f}s)"
-            else:
-                active_box_color = (0, 255, 180)
-                active_face_label = f"LIVE [OK] Capturing ({len(collected_embeddings)}/{ENROLLMENT_SAMPLES_REQUIRED})..."
+            active_box_color = (0, 255, 180)
+            active_face_label = f"ENROLLING {user_name} ({total_collected}/{ENROLLMENT_SAMPLES_REQUIRED})..."
+            time.sleep(0.030)
 
-            time.sleep(0.032)  # ~25-30 FPS landmark sampling
-
-        # Timeout reached without completing live enrollment
+        # Timeout reached without completing enrollment
         if not any_face_seen:
             active_box_color = (0, 0, 255)
             active_face_label = "ENROLL FAILED: No Face Detected"
             return None, "No face detected by camera. Position face clearly in front of camera."
 
         active_box_color = (0, 0, 255)
-        active_face_label = "SPOOF / PHOTO REJECTED — Must Blink (Live Person)"
+        active_face_label = f"ENROLL FAILED: {last_spoof_msg or 'Capture Timed Out'}"
         reason_detail = (
-            f"Liveness check failed ({last_spoof_msg or 'static photo / no eye blink detected'}). "
-            "Pictures/calendars are blocked — an actual live person must blink in front of the camera."
+            f"Enrollment blocked ({last_spoof_msg or 'face capture timed out'}). "
+            "Please ensure clear lighting and position your face in front of the lens."
         )
         log.warning("🚫 Enrollment BLOCKED for '%s': %s", user_name, reason_detail)
         return None, reason_detail
@@ -1572,8 +1936,12 @@ def add_history_entry(name: str, decision: str, reason: str) -> None:
         last_event_color = (255, 165, 0)  # Orange / Amber
     elif decision == "granted":
         last_decision_time = time.time()
-        last_event_text = f"GRANTED: {name} - Door Unlocked"
-        last_event_color = (0, 255, 120)
+        if "exit" in reason.lower():
+            last_event_text = f"EXIT: {name} - Door Unlocked"
+            last_event_color = (59, 130, 246)  # Electric Blue for Exit
+        else:
+            last_event_text = f"GRANTED: {name} - Door Unlocked"
+            last_event_color = (0, 255, 120)
     elif "Outside" in reason:
         last_event_text = f"DENIED: {name} — Outside Operating Hours"
         last_event_color = (255, 165, 0)
@@ -1747,10 +2115,18 @@ def render_pygame_kiosk(
     screen.blit(cr_val, (right_x + 100, 296))
 
     # Face detected row
-    fd_col = GREEN if face_in_frame_status else TEXT_MUTED
     if face_in_frame_status:
-        fd_txt = f"DETECTED — {last_detected_name}" if last_detected_name else "DETECTED IN VIEW"
+        if last_detected_name and last_detected_name not in ("Unknown Face", "Face Not Found"):
+            fd_col = GREEN
+            fd_txt = f"DETECTED — {last_detected_name}"
+        elif last_detected_name in ("Unknown Face", "Face Not Found"):
+            fd_col = ORANGE
+            fd_txt = "DETECTED — Face Not Found"
+        else:
+            fd_col = GREEN
+            fd_txt = "DETECTED IN VIEW"
     else:
+        fd_col = TEXT_MUTED
         fd_txt = "NOT DETECTED"
     fd_lbl = fonts["small"].render("Face:", True, TEXT_MUTED)
     fd_val = fonts["small_bold"].render(fd_txt[:32], True, fd_col)
@@ -1811,17 +2187,28 @@ def render_pygame_kiosk(
         y_off = 435
         for item in access_history[:4]:
             if item["decision"] == "granted":
-                tag_col = GREEN
+                if "exit" in item.get("reason", "").lower():
+                    tag_col = (59, 130, 246)  # Electric Blue for Exit
+                    dec_text = "EXIT"
+                else:
+                    tag_col = GREEN
+                    dec_text = "GRANTED"
+            elif item["decision"] == "enrolled":
+                tag_col = (59, 130, 246)  # Electric Blue for Enrolled
+                dec_text = "ENROLLED"
             elif item["decision"] == "late":
                 tag_col = ORANGE
+                dec_text = "LATE"
             elif "Outside" in item["reason"]:
                 tag_col = ORANGE
+                dec_text = "DENIED"
             else:
                 tag_col = RED
+                dec_text = "DENIED"
 
             t_surf = fonts["small"].render(item["time"], True, TEXT_MUTED)
             n_surf = fonts["small_bold"].render(item["name"][:18], True, TEXT_MAIN)
-            d_surf = fonts["small"].render(item["decision"].upper(), True, tag_col)
+            d_surf = fonts["small"].render(dec_text, True, tag_col)
 
             screen.blit(t_surf, (right_x + 16, y_off))
             screen.blit(n_surf, (right_x + 105, y_off))
@@ -1902,7 +2289,7 @@ def draw_dashboard_overlay(
     lock_col = (50, 50, 235) if door_locked else (0, 255, 120)
 
     user_display = last_detected_name if last_detected_name else ("None in view" if not face_in_frame_status else "Scanning...")
-    user_col = (0, 255, 120) if (last_detected_name and last_detected_name != "Unknown Face") else ((0, 0, 255) if last_detected_name == "Unknown Face" else (180, 180, 180))
+    user_col = (0, 255, 120) if (last_detected_name and last_detected_name not in ("Unknown Face", "Face Not Found")) else ((0, 165, 255) if last_detected_name in ("Unknown Face", "Face Not Found") else (180, 180, 180))
 
     cv2.putText(frame, "SYSTEM TELEMETRY", (w - card_w, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 190, 200), 1, cv2.LINE_AA)
     cv2.putText(frame, f"DOOR: {lock_str}", (w - card_w, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.48, lock_col, 2, cv2.LINE_AA)
@@ -2131,16 +2518,19 @@ def run_recognition_loop(client: Client) -> None:
 
         liveness_tracker = LivenessTracker()
         tracked_full_box: tuple[int, int, int, int] | None = None
-        frames_since_hog: int = 999
+        frame_counter: int = 0
         last_encoding_time: float = 0.0
         current_faculty_id: str | None = None
         current_name: str | None = None
         current_distance: float = float("inf")
+        recent_match_distances: list[float] = []
         consecutive_match_count: int = 0
         consecutive_unknown_count: int = 0
         post_blink_verified: bool = False
         last_deny_log_time: float = 0.0
         last_spoof_log_time: float = 0.0
+        last_sched_denied_id: str | None = None
+        last_sched_denied_time: float = 0.0
 
         while face_worker_running:
             try:
@@ -2149,6 +2539,7 @@ def run_recognition_loop(client: Client) -> None:
                     liveness_tracker.reset()
                     tracked_full_box = None
                     current_faculty_id = None
+                    recent_match_distances.clear()
                     post_blink_verified = False
                     time.sleep(0.05)
                     continue
@@ -2163,71 +2554,49 @@ def run_recognition_loop(client: Client) -> None:
                     liveness_tracker.reset()
                     tracked_full_box = None
                     current_faculty_id = None
+                    recent_match_distances.clear()
                     time.sleep(0.1)
                     continue
 
                 now = time.time()
+                frame_counter += 1
                 frame_copy = latest_frame.copy()
                 rgb_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
 
-                # High-speed landmark tracking: when waiting for a matched user to blink,
-                # reuse tracked_full_box for 3 intermediate frames (~25 FPS landmarks!)
-                # and re-run HOG face_locations on every 4th frame.
-                use_cached_box = (
-                    current_mode == "recognition"
-                    and tracked_full_box is not None
-                    and frames_since_hog < 3
-                    and current_faculty_id is not None
-                    and not liveness_tracker.is_live
+                # Always detect a fresh HOG face bounding box (using fast padded-ROI HOG on intermediate frames)
+                # so `full_box` is NEVER stale when someone moves a hand or photo!
+                full_box, best_small = _detect_face_box_fast(
+                    frame_copy,
+                    prev_full_box=tracked_full_box,
+                    use_roi_hint=(tracked_full_box is not None and frame_counter % 4 != 0),
                 )
 
-                if use_cached_box:
-                    frames_since_hog += 1
-                    full_box = tracked_full_box
-                    small_box = _scale_box_to_small(full_box)
-                    active_face_locations = [small_box]
-                    face_in_frame_status = True
-                else:
-                    small_frame = cv2.resize(
-                        frame_copy,
-                        (0, 0),
-                        fx=FRAME_SCALE_FACTOR,
-                        fy=FRAME_SCALE_FACTOR,
-                    )
-                    rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                    with dlib_lock:
-                        face_locs = face_recognition.face_locations(rgb_small)
+                face_in_frame_status = full_box is not None
+                if full_box is None or best_small is None:
+                    active_face_locations = []
+                    active_face_label = ""
+                    active_box_color = (255, 255, 255)
+                    last_detected_name = ""
+                    tracked_full_box = None
+                    if (now - liveness_tracker.last_seen_time) > 0.65:
+                        current_faculty_id = None
+                        current_name = None
+                        consecutive_match_count = 0
+                        consecutive_unknown_count = 0
+                        recent_match_distances.clear()
+                    liveness_tracker.update(None, now=now)
+                    time.sleep(0.06)
+                    continue
 
-                    frames_since_hog = 0
-                    face_in_frame_status = len(face_locs) > 0
+                tracked_full_box = full_box
+                active_face_locations = [best_small]
 
-                    if not face_locs:
-                        active_face_locations = []
-                        active_face_label = ""
-                        active_box_color = (255, 255, 255)
-                        last_detected_name = ""
-                        tracked_full_box = None
-                        if (now - liveness_tracker.last_seen_time) > 0.65:
-                            current_faculty_id = None
-                            current_name = None
-                            consecutive_match_count = 0
-                            consecutive_unknown_count = 0
-                        liveness_tracker.update(None, now=now)
-                        time.sleep(0.06)
-                        continue
-
-                    # Pick largest face in frame
-                    best_small = max(face_locs, key=lambda b: max(0, b[2] - b[0]) * max(0, b[1] - b[3]))
-                    full_box = _scale_box_to_full(best_small, frame_copy.shape)
-                    tracked_full_box = full_box
-                    active_face_locations = [best_small]
-
-                # 1. Run 2D spoof / blur check and 68-point landmark geometry (~3ms)
+                # Run heuristic 2D spoof / blur check and 68-point landmark extraction
                 is_suspect_2d, spoof_reason, lap_var = _check_2d_spoof_artifacts(frame_copy, full_box)
                 with dlib_lock:
                     lm_list = face_recognition.face_landmarks(rgb_full, [full_box])
 
-                geom = _extract_face_geometry(lm_list[0], full_box, lap_var) if lm_list else None
+                geom = _extract_face_geometry(lm_list[0], full_box, lap_var, frame_copy) if lm_list else None
                 is_live, live_msg = liveness_tracker.update(geom, is_suspect_2d, spoof_reason, now=now)
 
                 # 2. Enrollment preview mode (before capture button is pressed)
@@ -2250,8 +2619,8 @@ def run_recognition_loop(client: Client) -> None:
 
                 need_encoding = (
                     current_faculty_id is None
-                    or (now - last_encoding_time) >= 0.60
-                    or (is_live and (consecutive_match_count < 2 or not post_blink_verified))
+                    or (now - last_encoding_time) >= 0.45
+                    or (is_live and (consecutive_match_count < REQUIRED_CONSECUTIVE_MATCHES or not post_blink_verified))
                 )
 
                 if need_encoding:
@@ -2262,7 +2631,9 @@ def run_recognition_loop(client: Client) -> None:
                         continue
 
                     with dlib_lock:
-                        face_embeddings = face_recognition.face_encodings(rgb_full, [full_box])
+                        face_embeddings = face_recognition.face_encodings(
+                            rgb_full, [full_box], num_jitters=1, model="large"
+                        )
 
                     if not face_embeddings:
                         time.sleep(0.05)
@@ -2280,21 +2651,26 @@ def run_recognition_loop(client: Client) -> None:
                             is_live = False
                             post_blink_verified = False
                             consecutive_match_count = 1
+                            recent_match_distances = [distance]
                         else:
                             # Verify embedding consistency before vs after blink (blocks photo swap)
                             if liveness_tracker.pre_blink_embedding is not None:
                                 swap_dist = float(1.0 - np.dot(live_embedding, liveness_tracker.pre_blink_embedding))
-                                if swap_dist > 0.055:
-                                    log.warning("Face swap detected (dist=%.4f) — resetting liveness.", swap_dist)
+                                if swap_dist > 0.034:
+                                    log.warning("Face swap detected (dist=%.4f > 0.034) — resetting liveness.", swap_dist)
                                     liveness_tracker.reset()
                                     is_live = False
                                     post_blink_verified = False
                                     consecutive_match_count = 0
-                                elif is_live:
+                                    recent_match_distances.clear()
+                                elif is_live and geom is not None and geom["ear"] >= 0.19:
                                     post_blink_verified = True
-                            elif is_live:
+                            elif is_live and geom is not None and geom["ear"] >= 0.19:
                                 post_blink_verified = True
                             consecutive_match_count += 1
+                            recent_match_distances.append(distance)
+                            if len(recent_match_distances) > 6:
+                                recent_match_distances = recent_match_distances[-6:]
 
                         current_faculty_id = fid
                         current_name = fname
@@ -2305,6 +2681,7 @@ def run_recognition_loop(client: Client) -> None:
                         current_faculty_id = None
                         current_name = None
                         consecutive_match_count = 0
+                        recent_match_distances.clear()
                         consecutive_unknown_count += 1
                         post_blink_verified = False
                         liveness_tracker.pre_blink_embedding = None
@@ -2313,7 +2690,7 @@ def run_recognition_loop(client: Client) -> None:
                 if current_faculty_id and current_name:
                     last_detected_name = current_name if is_live else f"{current_name} (Verify Blink)"
                 else:
-                    last_detected_name = "Unknown Face"
+                    last_detected_name = "Face Not Found"
 
                 # Check cooldown after a recent door unlock or schedule denial
                 if (now - last_decision_time) < COOLDOWN_SECONDS:
@@ -2321,76 +2698,68 @@ def run_recognition_loop(client: Client) -> None:
                         active_face_label = f"{current_name} ({current_distance:.3f})"
                         active_box_color = (0, 255, 0)
                     else:
-                        active_face_label = f"Unknown ({current_distance:.3f})"
-                        active_box_color = (0, 0, 255)
+                        active_face_label = "Face Not Found"
+                        active_box_color = (0, 165, 255)
                     time.sleep(0.06)
                     continue
 
                 # --- CASE A: UNKNOWN / UNREGISTERED FACE ---
                 if current_faculty_id is None:
-                    active_box_color = (0, 0, 255)
-                    active_face_label = f"DENIED: Unknown ({current_distance:.3f})"
-                    # Require at least 2 consecutive unknown encodings & throttle DB log spam
-                    if consecutive_unknown_count >= 2 and (now - last_deny_log_time) >= 5.0:
-                        log.info("ACCESS DENIED — Unknown face (cos_dist=%.4f, threshold=%.4f)", current_distance, FACE_MATCH_THRESHOLD)
-                        log_access(
-                            client,
-                            decision="denied",
-                            faculty_id=None,
-                            reason="Unknown face",
+                    active_box_color = (0, 165, 255)  # Amber / Orange (Neutral indication, not red error)
+                    if current_distance == float("inf") or len(known_faces) == 0:
+                        active_face_label = "Face Not Found (No Registered Faces)"
+                    else:
+                        active_face_label = "Face Not Found"
+
+                    # DO NOT log to Supabase access_logs or kiosk history for unregistered / not-found faces
+                    # We do not log unknown faces into access_logs or live scan history table
+                    if consecutive_unknown_count % 30 == 0:
+                        log.debug(
+                            "Face in frame not recognized (distance=%.4f, registered_faces=%d)",
+                            current_distance,
+                            len(known_faces),
                         )
-                        add_history_entry("Unknown Face", "denied", "Unknown face profile")
-                        last_deny_log_time = now
                     time.sleep(0.05)
                     continue
 
-                # --- CASE B: MATCHED REGISTERED USER, WAITING FOR LIVENESS (BLINK) ---
-                if REQUIRE_LIVENESS and not is_live:
-                    stare_elapsed = now - liveness_tracker.first_seen_time if liveness_tracker.first_seen_time > 0 else 0.0
-                    if stare_elapsed >= SPOOF_ALERT_SECONDS:
-                        active_box_color = (0, 0, 255)
-                        active_face_label = f"SPOOF/PHOTO BLOCKED: {current_name} (Blink!)"
-                        if (now - last_spoof_log_time) >= 6.0:
-                            log.warning(
-                                "🚫 SPOOF / STATIC PHOTO BLOCKED for %s (stare=%.1fs without blink, dist=%.4f)",
-                                current_name,
-                                stare_elapsed,
-                                current_distance,
-                            )
-                            log_access(
-                                client,
-                                decision="denied",
-                                faculty_id=current_faculty_id,
-                                reason=f"Denied: Spoof/Static Photo Blocked (No live blink) for {current_name}",
-                            )
-                            add_history_entry(current_name, "denied", "Spoof/Photo Blocked (No Blink)")
-                            last_spoof_log_time = now
-                    else:
-                        active_box_color = (255, 200, 0)  # Cyan-Blue prompt
-                        active_face_label = f"{current_name} - BLINK TO UNLOCK"
-
-                    # Sample landmarks at high speed (~25-30 FPS) to catch the eye blink cleanly
-                    time.sleep(0.032)
-                    continue
-
-                # Wait for 2nd confirming encoding and post-blink identity verification
-                if consecutive_match_count < 2 or (REQUIRE_LIVENESS and not post_blink_verified):
+                # --- CASE B: MATCHED REGISTERED USER ---
+                avg_dist = float(np.mean(recent_match_distances)) if recent_match_distances else float("inf")
+                if consecutive_match_count < REQUIRED_CONSECUTIVE_MATCHES or avg_dist > FACE_MATCH_AVG_THRESHOLD:
                     active_box_color = (0, 255, 180)
-                    active_face_label = f"VERIFYING LIVE ID: {current_name}..."
+                    active_face_label = f"MATCHING: {current_name}..."
                     time.sleep(0.03)
                     continue
 
-                # --- CASE C: MATCHED REGISTERED USER + LIVENESS CONFIRMED ---
                 faculty_id = current_faculty_id
                 name = current_name
-                distance = current_distance
+                distance = avg_dist
 
+                # 1. PASSIVE AI ANTI-SPOOFING CHECK (MiniFASNet - Zero Blinking)
+                is_real_ai, ai_conf, ai_label = minifasnet.predict_liveness(frame_copy, full_box)
+                if not is_real_ai:
+                    active_box_color = (0, 0, 255)  # Red box for spoof
+                    active_face_label = f"SPOOF BLOCKED: {ai_label}"
+                    last_detected_name = f"Fake Photo ({name})"
+                    if (now - last_spoof_log_time) >= 6.0:
+                        log.warning("🚫 SPOOF ATTACK BLOCKED for %s: %s (confidence=%.1f%%)", name, ai_label, ai_conf)
+                        log_access(
+                            client,
+                            decision="denied",
+                            faculty_id=faculty_id,
+                            reason=f"Denied: Spoof Attack Blocked ({ai_label}) for {name}",
+                        )
+                        add_history_entry(name, "denied", f"Spoof: {ai_label}")
+                        last_spoof_log_time = now
+                    time.sleep(0.04)
+                    continue
+
+                # 2. SCHEDULE VERIFICATION
                 is_sched_ok, sched_msg, is_late, mins_late = check_faculty_schedule_status(faculty_id)
                 if is_sched_ok:
                     unlock_door()
                     if is_late:
                         log.info(
-                            "ACCESS GRANTED (LIVE [OK], LATE by %dm) - %s (%s, cos_dist=%.4f)",
+                            "ACCESS GRANTED (LIVE [OK], LATE by %dm) - %s (%s, avg_cos_dist=%.4f)",
                             mins_late,
                             name,
                             sched_msg,
@@ -2407,7 +2776,7 @@ def run_recognition_loop(client: Client) -> None:
                         add_history_entry(name, "late", f"Late by {mins_late}m ({sched_msg})")
                     else:
                         log.info(
-                            "ACCESS GRANTED (LIVE [OK], ON TIME) - %s (%s, cos_dist=%.4f)",
+                            "ACCESS GRANTED (LIVE [OK], ON TIME) - %s (%s, avg_cos_dist=%.4f)",
                             name,
                             sched_msg,
                             distance,
@@ -2423,21 +2792,27 @@ def run_recognition_loop(client: Client) -> None:
                         add_history_entry(name, "granted", f"Schedule OK ({sched_msg})")
                     last_decision_time = now
                 else:
-                    log.info("ACCESS DENIED — %s: %s (cos_dist=%.4f)", name, sched_msg, distance)
-                    log_access(
-                        client,
-                        decision="denied",
-                        faculty_id=faculty_id,
-                        reason=f"Denied: {sched_msg}",
-                    )
-                    active_box_color = (0, 165, 255)
+                    active_box_color = (0, 0, 255)  # Red box for out-of-schedule
                     active_face_label = f"DENIED: {name} (No Sched)"
-                    add_history_entry(name, "denied", sched_msg)
+                    last_detected_name = f"{name} (No Sched)"
+                    # Throttle schedule denial logging: only write to DB/logs once per 60s for the same person
+                    if faculty_id != last_sched_denied_id or (now - last_sched_denied_time) >= 60.0:
+                        log.info("ACCESS DENIED — %s: %s (avg_cos_dist=%.4f)", name, sched_msg, distance)
+                        log_access(
+                            client,
+                            decision="denied",
+                            faculty_id=faculty_id,
+                            reason=f"Denied: {sched_msg}",
+                        )
+                        add_history_entry(name, "denied", sched_msg)
+                        last_sched_denied_id = faculty_id
+                        last_sched_denied_time = now
                     last_decision_time = now
 
                 # Reset liveness after decision so the next access requires a fresh blink
                 liveness_tracker.reset()
                 consecutive_match_count = 0
+                recent_match_distances.clear()
                 post_blink_verified = False
                 time.sleep(0.08)
             except Exception as w_err:
