@@ -1,7 +1,7 @@
 """
 =============================================================================
   Laboratory Access Control System — Pi Camera Enrollment Utility
-  (With Anti-Spoofing & Live Eye-Blink Verification)
+  (Random head-turn challenge + 3D parallax liveness, same as door_guard)
 =============================================================================
   Usage:
     python enroll_face.py "Faculty Name"
@@ -14,20 +14,13 @@ import os
 import sys
 import time
 import logging
-import numpy as np
 import cv2
-import face_recognition
 from supabase import create_client
 
-from door_guard import (
-    _l2_norm,
-    _check_2d_spoof_artifacts,
-    _extract_face_geometry,
-    LivenessTracker,
-    ENROLLMENT_SAMPLES_REQUIRED,
-    ENROLLMENT_TIMEOUT_SECONDS,
-    MIN_ENROLL_FACE_SIZE_PX,
-)
+import threading
+
+import door_guard as dg
+from door_guard import reload_known_faces, capture_verified_live_enrollment
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("enroll_face")
@@ -77,96 +70,61 @@ def enroll_user(target: str) -> bool:
     profile_name = profile.get("name", "Unknown")
     log.info("Target Profile: %s (ID: %s)", profile_name, profile_id)
 
-    # 2. Open Camera Stream & Perform Live-Verified Multi-Frame Capture
-    log.info("Initializing camera... Stand in front of camera and look naturally.")
+    # 2. Open the camera and run the SAME live-challenge enrollment used by door_guard
+    #    (stop the door_guard service first: `sudo systemctl stop door_guard`,
+    #     only one program can hold the camera)
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        log.error("Unable to open camera (/dev/video0).")
+        log.error("Unable to open camera (/dev/video0). Is door_guard.py still running?")
         return False
-
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    tracker = LivenessTracker()
-    collected_embeddings: list[np.ndarray] = []
-    last_emb_time = 0.0
-    start_t = time.time()
+    latest = {"frame": None}
+    stop = threading.Event()
 
-    log.info(
-        "🛡️ Live verification active (%.0fs window): Please look at the camera...",
-        ENROLLMENT_TIMEOUT_SECONDS,
-    )
+    def _reader() -> None:
+        while not stop.is_set():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                latest["frame"] = frame
+            else:
+                time.sleep(0.02)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    # Needed for the "already registered as someone else" duplicate check
+    dg.LABORATORY_ID = os.environ.get("LABORATORY_ID", "") or dg.LABORATORY_ID
+    reload_known_faces(client)
+
+    def _show(text: str) -> None:
+        log.info("👉 %s", text)
 
     try:
-        while (time.time() - start_t) < ENROLLMENT_TIMEOUT_SECONDS:
-            ret, frame = cap.read()
-            if not ret or frame is None or frame.size == 0:
-                time.sleep(0.04)
-                continue
-
-            now = time.time()
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            small_rgb = cv2.resize(rgb, (0, 0), fx=0.5, fy=0.5)
-            small_locs = face_recognition.face_locations(small_rgb)
-
-            if not small_locs:
-                tracker.update(None, now=now)
-                time.sleep(0.04)
-                continue
-
-            best_small = max(small_locs, key=lambda b: max(0, b[2] - b[0]) * max(0, b[1] - b[3]))
-            h, w = frame.shape[:2]
-            full_box = (
-                max(0, min(h - 1, best_small[0] * 2)),
-                max(1, min(w, best_small[1] * 2)),
-                max(1, min(h, best_small[2] * 2)),
-                max(0, min(w - 1, best_small[3] * 2)),
-            )
-
-            is_suspect_2d, spoof_reason, lap_var = _check_2d_spoof_artifacts(
-                frame, full_box, min_size_px=MIN_ENROLL_FACE_SIZE_PX
-            )
-            lm_list = face_recognition.face_landmarks(rgb, [full_box])
-            geom = _extract_face_geometry(lm_list[0], full_box, lap_var, frame) if lm_list else None
-            is_live, _ = tracker.update(geom, is_suspect_2d, spoof_reason, now=now)
-
-            if (
-                geom is not None
-                and not is_suspect_2d
-                and (now - last_emb_time) >= 0.20
-                and len(collected_embeddings) < ENROLLMENT_SAMPLES_REQUIRED
-            ):
-                encs = face_recognition.face_encodings(rgb, [full_box], num_jitters=2, model="large")
-                if encs:
-                    cand_emb = _l2_norm(np.array(encs[0], dtype=np.float64))
-                    if collected_embeddings:
-                        if float(1.0 - np.dot(cand_emb, collected_embeddings[0])) > 0.038:
-                            log.warning("Face changed during enrollment — resetting samples.")
-                            collected_embeddings.clear()
-                            continue
-                    collected_embeddings.append(cand_emb)
-                    last_emb_time = now
-
-            if len(collected_embeddings) >= ENROLLMENT_SAMPLES_REQUIRED:
-                embedding = _l2_norm(np.mean(np.stack(collected_embeddings, axis=0), axis=0))
-                embedding_list = [float(val) for val in embedding]
-                log.info("Updating Supabase profile with 128-d face embedding...")
-                client.table("profiles").update({
-                    "face_embedding": embedding_list,
-                    "camera_status": "completed",
-                }).eq("id", profile_id).execute()
-                log.info("✅ SUCCESS: Face embedding registered for '%s'!", profile_name)
-                return True
-
-            time.sleep(0.03)
+        embedding, message, status_code = capture_verified_live_enrollment(
+            user_name=profile_name,
+            profile_id=profile_id,
+            on_progress=_show,
+            frame_source=lambda: latest["frame"],
+        )
     finally:
+        stop.set()
+        reader.join(timeout=1.0)
         cap.release()
 
-    log.error(
-        "🚫 ENROLLMENT BLOCKED: Liveness verification failed (static photo or screen spoof detected)."
-    )
-    return False
+    if embedding is None:
+        client.table("profiles").update({"camera_status": status_code}).eq("id", profile_id).execute()
+        log.error("🚫 ENROLLMENT FAILED: %s", message)
+        return False
+
+    client.table("profiles").update({
+        "face_embedding": [float(v) for v in embedding],
+        "camera_status": "completed",
+    }).eq("id", profile_id).execute()
+    log.info("✅ SUCCESS: Face embedding registered for '%s'!", profile_name)
+    return True
 
 
 if __name__ == "__main__":

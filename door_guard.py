@@ -65,6 +65,19 @@ except ImportError:
 from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
+# Active challenge liveness (random head turns + 3D parallax) — see liveness.py
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from liveness import (  # noqa: E402
+    ChallengeSession,
+    landmarks_to_array,
+    LEFT as LIVENESS_LEFT,
+    RIGHT as LIVENESS_RIGHT,
+    UP as LIVENESS_UP,
+    DOWN as LIVENESS_DOWN,
+)
+
+# ---------------------------------------------------------------------------
 # RPi.GPIO — controls the relay that drives the solenoid lock
 # ---------------------------------------------------------------------------
 try:
@@ -102,35 +115,37 @@ SUPABASE_KEY: str = os.environ.get(
 LABORATORY_NAME: str = os.environ.get("LABORATORY_NAME", "CCS Laboratory")
 LABORATORY_ID: str = os.environ.get("LABORATORY_ID", "")
 
-# -- Face Recognition & Anti-Spoofing ----------------------------------------
-# NOTE: Stored embeddings are L2-normalized unit vectors compared via Cosine distance
-# (1 - dot(u, v)). Because raw dlib vectors have norm ~1.34 (2 * ||u||^2 ≈ 3.60):
-#   cos_dist = d_euc^2 / 3.60
-#   - Same person (raw dlib Euclidean 0.18 - 0.34) -> Cosine distance ~ 0.009 to 0.032
-#   - Different Filipino person in same lighting (raw Euclidean 0.40 - 0.50) -> Cosine distance ~ 0.044 to 0.068
-# NEVER set Cosine threshold above 0.040 or different people will falsely match!
+# -- Face Recognition ---------------------------------------------------------
+# Stored embeddings are L2-normalised and compared with cosine distance
+# (1 - dot(u, v)). dlib's raw 128-d descriptors have a norm of ~1.45, so
+#   cos_dist ≈ euclidean² / 4.2      (0.036 ≈ dlib euclidean 0.39)
+# Same person under the Pi camera:  ~0.010 – 0.034
+# Different (similar-looking) people: ~0.040 – 0.080
+# Never raise FACE_MATCH_THRESHOLD above 0.042 or look-alikes will match.
 _raw_thresh = float(os.environ.get("FACE_MATCH_THRESHOLD", "0.036"))
-FACE_MATCH_THRESHOLD: float        = 0.036 if _raw_thresh > 0.042 else _raw_thresh
-FACE_MATCH_AVG_THRESHOLD: float    = 0.038  # Multi-frame average Cosine distance must be <= 0.038
-FACE_MATCH_MARGIN: float           = 0.014  # Minimum separation over 2nd-best profile
-REQUIRED_CONSECUTIVE_MATCHES: int  = 2      # Fast 2-frame match verification (~0.15s) before unlocking
+FACE_MATCH_THRESHOLD: float        = min(_raw_thresh, 0.042)
+FACE_MATCH_MARGIN: float           = float(os.environ.get("FACE_MATCH_MARGIN", "0.012"))  # best must beat 2nd-best profile by this
+FACE_MATCH_SURE: float             = 0.015  # below this the match is unambiguous even without margin
+FACE_MATCH_VOTES: int              = 3      # live embeddings averaged before deciding who it is
+DUPLICATE_FACE_THRESHOLD: float    = float(os.environ.get("DUPLICATE_FACE_THRESHOLD", "0.050"))  # enrollment: reject if another profile is this close
 FRAME_SCALE_FACTOR: float          = 0.5    # Downscale factor for fast HOG box detection
 MIN_FACE_SIZE_PX: int              = 80     # Minimum face width/height in 640x480 pixels
-MIN_ENROLL_FACE_SIZE_PX: int       = 95     # Minimum face size during enrollment for high-res eyes
+MIN_ENROLL_FACE_SIZE_PX: int       = 95     # Minimum face size during enrollment
 
-# -- Liveness / Anti-Spoofing Configuration ----------------------------------
-REQUIRE_LIVENESS: bool             = False  # Zero blinking needed: MiniFASNet passively blocks photos & screens!
-BLINK_REL_DROP_RATIO: float        = 0.74   # EAR must drop to <= 74% of open-eye baseline (>=26% drop)
-BLINK_NORM_DROP_RATIO: float       = 0.75   # Pitch-normalized EAR must drop to <= 75% of baseline
-BLINK_MIN_ABS_DROP: float          = 0.052  # Minimum absolute EAR drop from open-eye baseline
-BLINK_RECOVERY_RATIO: float        = 0.89   # Post-blink EAR must recover to >= 89% of baseline
-BLINK_MIN_EYE_PIXEL_DELTA: float   = 5.5    # Minimum grayscale pixel MAD inside eye patch on eyelid closure
-BLINK_EYE_VS_CHEEK_RATIO: float    = 1.75   # Eye patch pixel change must be >= 1.75x nose/cheek pixel change
-BLINK_CONTRAST_DROP_RATIO: float   = 0.88   # Closed-eye internal pupil/sclera contrast must drop <= 88%
-LIVENESS_WINDOW_SECONDS: float     = 4.5    # Sliding time window for blink/liveness history
-SPOOF_ALERT_SECONDS: float         = 3.0    # Seconds of static stare before logging spoof warning
-ENROLLMENT_TIMEOUT_SECONDS: float  = 8.5    # Max seconds to wait for live blink during enrollment
-ENROLLMENT_SAMPLES_REQUIRED: int   = 3      # Number of clean open-eye frames to average on enroll
+# -- Liveness / Anti-Spoofing --------------------------------------------------
+# Active challenge: the person is asked to turn LEFT/RIGHT (and UP/DOWN when
+# enrolling) in a random order, and the turn must show real 3D nose parallax.
+# See liveness.py for the details.
+REQUIRE_LIVENESS: bool             = os.environ.get("REQUIRE_LIVENESS", "1") == "1"
+RECOGNITION_CHALLENGES: int        = int(os.environ.get("RECOGNITION_CHALLENGES", "1"))  # 1 random LEFT/RIGHT turn at the door
+ENROLLMENT_CHALLENGES: int         = int(os.environ.get("ENROLLMENT_CHALLENGES", "3"))   # random LEFT/RIGHT/UP/DOWN when registering
+ENROLLMENT_TIMEOUT_SECONDS: float  = float(os.environ.get("ENROLLMENT_TIMEOUT_SECONDS", "40"))
+ENROLLMENT_SAMPLES_REQUIRED: int   = 5      # frontal embeddings averaged into the stored template
+# Passive MiniFASNet model (photo/screen texture classifier). Used as an extra
+# vote: only blocks when the AVERAGE live probability over several frames is low.
+PASSIVE_ANTISPOOF: bool            = os.environ.get("PASSIVE_ANTISPOOF", "1") == "1"
+PASSIVE_LIVE_MIN: float            = float(os.environ.get("PASSIVE_LIVE_MIN", "0.25"))
+PASSIVE_MIN_FRAMES: int            = 6
 
 # -- Cooldown ----------------------------------------------------------------
 COOLDOWN_SECONDS: int = 8           # Minimum seconds between repeated decisions
@@ -436,6 +451,16 @@ def check_faculty_schedule_status(faculty_id: str) -> tuple[bool, str, bool, int
     current_time = time.strftime("%H:%M:%S", now_struct)
     current_mins = now_struct.tm_hour * 60 + now_struct.tm_min
 
+    # 2. Hard lab hours for instructors (7:00 AM – 7:00 PM), even if a schedule in
+    #    the database says otherwise (e.g. one typed directly into Supabase).
+    if not (OP_HOURS_START * 60 <= current_mins < OP_HOURS_END * 60):
+        return (
+            False,
+            f"Outside lab hours ({OP_HOURS_START}:00 AM – {OP_HOURS_END - 12}:00 PM)",
+            False,
+            0,
+        )
+
     with known_schedules_lock:
         fac_schedules = [s for s in known_schedules if str(s.get("faculty_id")) == str(faculty_id)]
 
@@ -570,15 +595,22 @@ def start_realtime_listener(client: Client) -> None:
                             enrollment_status = "capturing"
 
                             if latest_frame is not None:
-                                emb, err_msg = capture_verified_live_enrollment(user_name=pname)
+                                def _mirror_progress(text: str, _pid=pid) -> None:
+                                    # Lets the mobile app show the same prompt as the kiosk screen
+                                    client.table("profiles").update(
+                                        {"camera_status": f"capturing: {text}"}
+                                    ).eq("id", _pid).execute()
+
+                                emb, err_msg, status_code = capture_verified_live_enrollment(
+                                    user_name=pname, profile_id=pid, on_progress=_mirror_progress
+                                )
                                 if emb is not None:
                                     client.table("profiles").update({
                                         "face_embedding": [float(v) for v in emb],
                                         "camera_status": "completed"
                                     }).eq("id", pid).execute()
                                     enrollment_status = "completed"
-                                    add_history_entry(pname, "enrolled", "Face Biometrics Enrolled")
-                                    # Log official enrollment in Supabase access_logs so live scan logs show ENROLLED
+                                    add_history_entry(pname, "enrolled", "Face Biometrics Enrolled (live verified)")
                                     log_access(
                                         client,
                                         decision="granted",
@@ -589,7 +621,6 @@ def start_realtime_listener(client: Client) -> None:
                                     log.info(f"✅ Face embedding enrolled for '{pname}'!")
                                     reload_known_faces(client)
                                 else:
-                                    status_code = "failed_no_face" if "No face" in err_msg else f"failed_spoof: {err_msg}"
                                     client.table("profiles").update({"camera_status": status_code}).eq("id", pid).execute()
                                     enrollment_status = status_code
                                     add_history_entry(pname, "denied", f"Enroll Rejected: {err_msg}")
@@ -802,9 +833,10 @@ class EnrollmentRequestHandler(BaseHTTPRequestHandler):
                 enrollment_name = pname
                 enrollment_status = "capturing"
 
-                embedding, err_msg = capture_verified_live_enrollment(user_name=pname)
+                embedding, err_msg, status_code = capture_verified_live_enrollment(
+                    user_name=pname, profile_id=profile_id
+                )
                 if embedding is None:
-                    status_code = "failed_no_face" if "No face" in err_msg else f"failed_spoof: {err_msg}"
                     enrollment_status = status_code
                     self.supabase_client.table("profiles").update({"camera_status": status_code}).eq("id", profile_id).execute()
                     add_history_entry(pname, "denied", f"Enroll Rejected: {err_msg}")
@@ -1010,53 +1042,62 @@ def log_access(
 #  FACE RECOGNITION & LIVENESS / ANTI-SPOOFING ENGINE
 # =============================================================================
 
-def find_best_match(live_embedding: np.ndarray) -> tuple[str | None, str | None, float]:
-    """
-    Compare a live face embedding against every stored profile using strict
-    Cosine distance (1 - dot product of L2-normalized unit vectors) plus a
-    second-best separation margin so unregistered or different people never
-    falsely match a registered profile.
-
-    Returns:
-        (faculty_id, name, distance) where faculty_id/name are None if
-        no profile passes the strict threshold (0.036) and separation margin.
-    """
-    live_norm = _l2_norm(live_embedding)
-    best_cosine: float = float("inf")
-    second_best_cosine: float = float("inf")
-    best_id: str | None = None
-    best_name: str | None = None
-
+def _rank_profiles(live_norm: np.ndarray, exclude_id: str | None = None) -> list[tuple[float, str, str]]:
+    """Return [(cos_dist, id, name)] sorted best-first, one entry per profile."""
+    ranked: list[tuple[float, str, str]] = []
     with known_faces_lock:
         for profile in known_faces:
-            cos_dist = float(1.0 - np.dot(live_norm, profile["embedding"]))
-            if cos_dist < best_cosine:
-                if best_id is not None and profile["id"] != best_id:
-                    second_best_cosine = best_cosine
-                best_cosine = cos_dist
-                best_id = profile["id"]
-                best_name = profile["name"]
-            elif profile["id"] != best_id and cos_dist < second_best_cosine:
-                second_best_cosine = cos_dist
+            if exclude_id is not None and str(profile["id"]) == str(exclude_id):
+                continue
+            emb = profile["embedding"]
+            if emb.shape != live_norm.shape:
+                continue
+            ranked.append((float(1.0 - np.dot(live_norm, emb)), profile["id"], profile["name"]))
+    ranked.sort(key=lambda r: r[0])
+    return ranked
 
-    if best_cosine < FACE_MATCH_THRESHOLD:
-        # Require a clear separation margin over the 2nd-best profile whenever
-        # multiple profiles exist and the match is not an ultra-tight (<0.024) hit.
-        if (
-            second_best_cosine < float("inf")
-            and best_cosine > 0.024
-            and (second_best_cosine - best_cosine) < FACE_MATCH_MARGIN
-        ):
-            log.warning(
-                "Ambiguous face match rejected: best=%s (%.4f) vs 2nd=%.4f",
-                best_name,
-                best_cosine,
-                second_best_cosine,
-            )
-            return None, None, best_cosine
-        return best_id, best_name, best_cosine
 
-    return None, None, best_cosine
+def find_best_match(live_embedding: np.ndarray) -> tuple[str | None, str | None, float]:
+    """
+    Compare a (preferably multi-frame averaged) live embedding against every
+    stored profile using cosine distance.
+
+    A match must:
+      1. be below FACE_MATCH_THRESHOLD, and
+      2. beat the 2nd-best profile by FACE_MATCH_MARGIN (unless it is an
+         unambiguous < FACE_MATCH_SURE hit).
+    Otherwise the face is treated as "not registered" — refusing is always
+    better than opening the door for the wrong person.
+
+    Returns:
+        (faculty_id, name, distance) — id/name are None when no safe match.
+    """
+    ranked = _rank_profiles(_l2_norm(live_embedding))
+    if not ranked:
+        return None, None, float("inf")
+
+    best_cos, best_id, best_name = ranked[0]
+    second_cos = ranked[1][0] if len(ranked) > 1 else float("inf")
+
+    if best_cos >= FACE_MATCH_THRESHOLD:
+        return None, None, best_cos
+
+    if best_cos > FACE_MATCH_SURE and (second_cos - best_cos) < FACE_MATCH_MARGIN:
+        log.warning(
+            "Ambiguous face match rejected: best=%s (%.4f) vs 2nd=%s (%.4f)",
+            best_name, best_cos, ranked[1][2], second_cos,
+        )
+        return None, None, best_cos
+
+    return best_id, best_name, best_cos
+
+
+def find_duplicate_profile(embedding: np.ndarray, exclude_id: str | None = None) -> tuple[str | None, str | None, float]:
+    """During enrollment: is this face already registered under another profile?"""
+    ranked = _rank_profiles(_l2_norm(embedding), exclude_id=exclude_id)
+    if ranked and ranked[0][0] < DUPLICATE_FACE_THRESHOLD:
+        return ranked[0][1], ranked[0][2], ranked[0][0]
+    return None, None, ranked[0][0] if ranked else float("inf")
 
 
 def _scale_box_to_full(small_box: tuple[int, int, int, int], frame_shape: tuple[int, ...]) -> tuple[int, int, int, int]:
@@ -1186,44 +1227,52 @@ class MiniFASNetClassifier:
 
     def predict_liveness(
         self, frame_bgr: np.ndarray, full_box: tuple[int, int, int, int]
-    ) -> tuple[bool, float, str]:
+    ) -> tuple[bool, float, str, float]:
         """
         Classifies whether the face in frame_bgr is a genuine live person or a presentation attack.
+
+        Pre-processing matches the original Silent-Face-Anti-Spoofing repo exactly:
+          * crop = face box scaled by 2.7, SHIFTED to stay inside the frame (no padding)
+          * resized to 80x80, BGR channel order, RAW 0-255 float values (NO /255!)
+        The previous version divided by 255, which makes the model answer
+        "screen replay" ~99% of the time for real faces.
+
         Returns:
-            (is_real: bool, confidence_pct: float, attack_type: str)
+            (is_real, confidence_pct, label, p_live)
         """
         if not self.is_loaded() or frame_bgr is None or frame_bgr.size == 0:
-            return True, 100.0, "Real (Bypass)"
+            return True, 100.0, "Real (model not loaded)", 1.0
 
         try:
             top, right, bottom, left = full_box
-            w = right - left
-            h = bottom - top
-            if w < 30 or h < 30:
-                return True, 50.0, "Real"
+            box_w = float(right - left)
+            box_h = float(bottom - top)
+            if box_w < 30 or box_h < 30:
+                return True, 50.0, "Real (face too small to judge)", 0.5
 
-            xc = left + w * 0.5
-            yc = top + h * 0.5
-            max_side = max(w, h)
-            edge_size = max_side * 2.7
-            nx1 = int(xc - edge_size * 0.5)
-            ny1 = int(yc - edge_size * 0.5)
-            nx2 = int(nx1 + edge_size)
-            ny2 = int(ny1 + edge_size)
+            src_h, src_w = frame_bgr.shape[:2]
+            scale = min((src_h - 1) / box_h, (src_w - 1) / box_w, 2.7)
+            new_w, new_h = box_w * scale, box_h * scale
+            cx, cy = left + box_w / 2.0, top + box_h / 2.0
+            x1, y1 = cx - new_w / 2.0, cy - new_h / 2.0
+            x2, y2 = cx + new_w / 2.0, cy + new_h / 2.0
+            if x1 < 0:
+                x2 -= x1
+                x1 = 0
+            if y1 < 0:
+                y2 -= y1
+                y1 = 0
+            if x2 > src_w - 1:
+                x1 -= x2 - src_w + 1
+                x2 = src_w - 1
+            if y2 > src_h - 1:
+                y1 -= y2 - src_h + 1
+                y2 = src_h - 1
 
-            h_img, w_img = frame_bgr.shape[:2]
-            pad_x1 = max(0, -nx1)
-            pad_y1 = max(0, -ny1)
-            pad_x2 = max(0, nx2 - w_img)
-            pad_y2 = max(0, ny2 - h_img)
-
-            cropped = frame_bgr[max(0, ny1) : min(h_img, ny2), max(0, nx1) : min(w_img, nx2)]
-            if pad_x1 > 0 or pad_y1 > 0 or pad_x2 > 0 or pad_y2 > 0:
-                cropped = cv2.copyMakeBorder(
-                    cropped, pad_y1, pad_y2, pad_x1, pad_x2, cv2.BORDER_CONSTANT, value=[0, 0, 0]
-                )
-
-            img_80 = cv2.resize(cropped, (80, 80), interpolation=cv2.INTER_LINEAR)
+            cropped = frame_bgr[int(y1): int(y2) + 1, int(x1): int(x2) + 1]
+            if cropped.size == 0:
+                return True, 50.0, "Real (empty crop)", 0.5
+            img_80 = cv2.resize(cropped, (80, 80))
             blob = np.transpose(img_80.astype(np.float32), (2, 0, 1))[np.newaxis, ...]
 
             if self.session is not None:
@@ -1235,21 +1284,16 @@ class MiniFASNetClassifier:
 
             exp_scores = np.exp(logits - np.max(logits))
             probs = exp_scores / np.sum(exp_scores)
-            p_print = float(probs[0])
-            p_live = float(probs[1])
-            p_replay = float(probs[2])
+            p_print, p_live, p_replay = float(probs[0]), float(probs[1]), float(probs[2])
 
-            # Class 1 is Live Real Human
-            is_real = p_live >= 0.50
-            if is_real:
-                return True, p_live * 100.0, "Live Real Human"
-            elif p_print >= p_replay:
-                return False, p_print * 100.0, "Fake Photo (Print Attack)"
-            else:
-                return False, p_replay * 100.0, "Fake Photo (Screen Replay)"
+            if p_live >= max(p_print, p_replay):
+                return True, p_live * 100.0, "Live Real Human", p_live
+            if p_print >= p_replay:
+                return False, p_print * 100.0, "Fake Photo (Print Attack)", p_live
+            return False, p_replay * 100.0, "Fake Photo (Screen Replay)", p_live
         except Exception as exc:
             log.debug("MiniFASNet inference error: %s", exc)
-            return True, 100.0, "Real (Fallback)"
+            return True, 50.0, "Real (inference error)", 0.5
 
 
 minifasnet = MiniFASNetClassifier(MINIFASNET_MODEL_PATH)
@@ -1284,7 +1328,7 @@ def _check_2d_spoof_artifacts(
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    if lap_var < 12.0:
+    if lap_var < 8.0:
         return True, "Image too blurry (hold still)", lap_var
 
     # Check central face region for unnatural specular screen/glossy calendar glare
@@ -1293,23 +1337,28 @@ def _check_2d_spoof_artifacts(
     if inner.size > 0:
         hsv = cv2.cvtColor(inner, cv2.COLOR_BGR2HSV)
         # Clipped bright low-saturation glare (typical of phone screen or glossy paper reflection)
-        glare_mask = (hsv[:, :, 2] > 248) & (hsv[:, :, 1] < 20)
+        glare_mask = (hsv[:, :, 2] > 250) & (hsv[:, :, 1] < 15)
         glare_ratio = float(np.mean(glare_mask))
-        if glare_ratio > 0.18:
+        if glare_ratio > 0.35:
             return True, "Screen/paper glare detected", lap_var
 
         ycrcb = cv2.cvtColor(inner, cv2.COLOR_BGR2YCrCb)
         cr_std = float(np.std(ycrcb[:, :, 1]))
         cb_std = float(np.std(ycrcb[:, :, 2]))
-        if cr_std < 2.2 and cb_std < 2.2:
+        if cr_std < 1.5 and cb_std < 1.5:
             return True, "Flat print chrominance detected", lap_var
 
-        # Check for OLED/LCD screen blue-backlight emission bias & digital screen Moiré noise
+        # Check for harsh flashlight / direct beam overexposure (blown-out white highlights)
+        mean_brightness = float(np.mean(hsv[:, :, 2]))
+        if mean_brightness > 228.0 or glare_ratio > 0.45:
+            return True, "Too bright / harsh light (move light away)", lap_var
+
+        # Check for OLED/LCD screen blue-backlight emission bias (strong blue excess)
         mean_b = float(np.mean(inner[:, :, 0]))
         mean_r = float(np.mean(inner[:, :, 2]))
-        if mean_b > (mean_r + 12.0):
+        if mean_b > (mean_r + 38.0):
             return True, "Digital screen backlight detected", lap_var
-        if lap_var > 4800.0:
+        if lap_var > 6000.0:
             return True, "Screen Moire / print halftone artifact detected", lap_var
 
     return False, "", lap_var
@@ -1415,6 +1464,11 @@ def _extract_face_geometry(
         nose_dist = float(np.linalg.norm(nose_pt - eye_mid))
         pitch_ratio = max(0.30, nose_dist / inter_ocular)
 
+        # 3D Head Yaw & Pitch angles
+        # Center = 0.0, Turning Left < -0.07, Turning Right > +0.07
+        head_yaw = float((nose_pt[0] - eye_mid[0]) / max(1.0, inter_ocular))
+        head_pitch = float((nose_pt[1] - eye_mid[1]) / max(1.0, inter_ocular))
+
         # Pitch-compensated EAR: tilting a flat calendar photo scales both `ear` and `pitch_ratio`
         # by cos(theta), so `ear_norm` stays flat on tilted photos but drops sharply on real blinks!
         ear_norm = ear / pitch_ratio
@@ -1460,9 +1514,7 @@ def _extract_face_geometry(
         r_y2 = int(min(h_f, r_center[1] + half))
         r_crop = frame_bgr[r_y1:r_y2, r_x1:r_x2]
 
-        p_l_closed = mrl_classifier.predict_closed_prob(l_crop) if mrl_classifier.is_loaded() else 0.0
-        p_r_closed = mrl_classifier.predict_closed_prob(r_crop) if mrl_classifier.is_loaded() else 0.0
-        eye_closed_prob = max(p_l_closed, p_r_closed)
+        eye_closed_prob = 0.0
 
         return {
             "left_ear": left_ear,
@@ -1481,327 +1533,106 @@ def _extract_face_geometry(
             "ref_patch": ref_patch,
             "eye_contrast": eye_contrast,
             "eye_closed_prob": eye_closed_prob,
-            "p_l_closed": p_l_closed,
-            "p_r_closed": p_r_closed,
+            "head_yaw": head_yaw,
+            "head_pitch": head_pitch,
         }
     except Exception:
         return None
 
 
-class LivenessTracker:
-    """
-    High-speed Photometric + Geometric Liveness Verifier that blocks printed calendar
-    photos, ID cards, and phone screens during both Enrollment and Recognition.
+def _face_box_usable(full_box: tuple[int, int, int, int], frame_shape: tuple[int, ...], min_size_px: int) -> tuple[bool, str]:
+    """Face must be big enough and fully inside the frame (cut-off faces give garbage landmarks)."""
+    h, w = frame_shape[:2]
+    top, right, bottom, left = full_box
+    if (bottom - top) < min_size_px or (right - left) < min_size_px:
+        return False, "Move closer to the camera"
+    margin = 6
+    if top < margin or left < margin or bottom > h - margin or right > w - margin:
+        return False, "Center your face in the frame"
+    return True, ""
 
-    Requires a verified bilateral eye blink passing 6 independent gates:
-      1. Bilateral Geometric EAR Drop: `ear <= 0.74 * base_ear` (>=26% drop) and
-         `base_ear - ear >= 0.052`, blocking 1-pixel integer landmark rounding jitter.
-      2. Pitch-Compensated EAR Drop: `ear_norm <= 0.75 * base_ear_norm`, blocking
-         tilted/angled calendar photos.
-      3. Photometric Eyelid Pixel Change: Corner-anchored eye patches must change by
-         `>= 5.5` gray levels when closing (`s_pre -> sk`) and `>= 5.0` when reopening
-         (`sk -> s_post`), and return to open-eye appearance (`s_pre ~ s_post`).
-      4. Differential Eye-vs-Cheek Ratio: Eye patch pixel change must be `>= 1.75x`
-         the nose/cheek reference patch change, blocking waved/shaken/moved photos.
-      5. Pupil/Sclera Contrast Reduction: Internal eye contrast must drop (`<= 0.88x`)
-         at the blink valley as smooth eyelid skin covers the dark iris and white sclera.
-      6. Rigid Head Pitch & Translation Stability (`< 7%` shift) during the blink.
-    """
 
-    def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        self.samples: list[dict] = []
-        self.is_live: bool = False
-        self.blink_count: int = 0
-        self.first_seen_time: float = 0.0
-        self.last_seen_time: float = 0.0
-        self.live_confirmed_time: float = 0.0
-        self.tracked_faculty_id: str | None = None
-        self.pre_blink_embedding: np.ndarray | None = None
-        self.spoof_reason: str = ""
-
-    def update(
-        self,
-        geom: dict | None,
-        is_suspect_2d: bool = False,
-        spoof_reason: str = "",
-        now: float | None = None,
-    ) -> tuple[bool, str]:
-        if now is None:
-            now = time.time()
-
-        if geom is None:
-            if self.last_seen_time > 0 and (now - self.last_seen_time) > 0.85:
-                self.reset()
-            return self.is_live, "Position face clearly in view"
-
-        # Reset tracker if face disappeared for >0.85s or jumped abruptly (e.g. swapped photo)
-        if self.last_seen_time > 0 and (now - self.last_seen_time) > 0.85:
-            self.reset()
-        elif self.samples:
-            prev = self.samples[-1]
-            jump = float(np.linalg.norm(geom["center"] - prev["center"]))
-            if jump > 0.35 * max(geom["inter_ocular"], prev["inter_ocular"]):
-                log.debug("Face position jump detected (%.1f px) — resetting liveness.", jump)
-                self.reset()
-
-        if self.first_seen_time == 0.0:
-            self.first_seen_time = now
-        self.last_seen_time = now
-
-        if is_suspect_2d:
-            self.spoof_reason = spoof_reason
-            return False, f"Spoof/Blur Check: {spoof_reason}"
-
-        sample = dict(geom)
-        sample["t"] = now
-        self.samples.append(sample)
-
-        # Keep sliding window of recent samples
-        cutoff = now - LIVENESS_WINDOW_SECONDS
-        if len(self.samples) > 120 or (self.samples and self.samples[0]["t"] < cutoff):
-            self.samples = [s for s in self.samples if s["t"] >= cutoff][-120:]
-
-        # Expire previous live confirmation after 4.5 seconds if door hasn't unlocked yet
-        if self.is_live and (now - self.live_confirmed_time) > 4.5:
-            self.is_live = False
-
-        # Passive live face verification (zero forced eye blinking needed)
-        # Verifies natural face geometry, sharpness, and absence of 2D photo/screen spoof artifacts
-        min_samples = 3
-        if not self.is_live and len(self.samples) >= min_samples:
-            if not is_suspect_2d:
-                self.is_live = True
-                self.live_confirmed_time = now
-                self.spoof_reason = ""
-                log.info("[LIVENESS] Verified live face (texture, geometry, no spoof artifacts).")
-
-        if self.is_live:
-            return True, "LIVE VERIFIED [OK]"
-
-        if is_suspect_2d:
-            return False, f"Spoof Blocked: {spoof_reason}"
-        return False, "Position Face in Front of Camera"
-
-    def _detect_verified_blink(self) -> bool:
-        """
-        Scan sliding window for a genuine bilateral eye blink valley bounded by
-        open-eye frames before and after. Uses MRL Deep Learning Eye CNN as primary
-        verifier, with landmark EAR fallback.
-        """
-        n = len(self.samples)
-        if n < 4:
-            return False
-
-        # --- Gate 1: MRL Deep Learning Eye Blink CNN Classifier ---
-        if mrl_classifier.is_loaded():
-            probs = np.array([s.get("eye_closed_prob", 0.0) for s in self.samples], dtype=np.float64)
-            times = np.array([s["t"] for s in self.samples], dtype=np.float64)
-
-            # Detect blink: eyes were open, closed (prob >= 0.55), and reopened (prob <= 0.40)
-            closed_mask = probs >= 0.55
-            if np.any(closed_mask):
-                closed_indices = np.where(closed_mask)[0]
-                k = int(closed_indices[-1])
-                # Ensure we have frames before and after the closed state
-                if 0 < k < (n - 1):
-                    t_closed = times[k]
-                    # Open frames within 0.8s before closure
-                    pre_open = any(probs[i] <= 0.40 and (t_closed - times[i]) <= 0.80 for i in range(k))
-                    # Open frames within 0.8s after closure
-                    post_open = any(probs[j] <= 0.40 and (times[j] - t_closed) <= 0.80 for j in range(k + 1, n))
-                    if pre_open and post_open:
-                        first_k = int(closed_indices[0])
-                        closed_duration = times[k] - times[first_k]
-                        if closed_duration <= 0.65:
-                            log.info(
-                                "👁️ [MRL LIVENESS] Real Eye Blink Confirmed via CNN! (P_closed=%.2f, dur=%.2fs)",
-                                probs[k],
-                                closed_duration,
-                            )
-                            return True
-
-            # When MRL CNN is loaded, rely exclusively on its high-accuracy eyelid predictions
-            return False
-
-        # --- Fallback Gate: Landmark EAR (used only if mrl_eye_model.onnx is absent) ---
-        if n < 5:
-            return False
-
-        lap_vals = np.array([s["lap_var"] for s in self.samples], dtype=np.float64)
-        median_lap = float(np.median(lap_vals))
-        min_acceptable_lap = max(12.0, 0.48 * median_lap)
-
-        ears = np.array([s["ear"] for s in self.samples], dtype=np.float64)
-        ear_norms = np.array([s["ear_norm"] for s in self.samples], dtype=np.float64)
-        left_ears = np.array([s["left_ear"] for s in self.samples], dtype=np.float64)
-        right_ears = np.array([s["right_ear"] for s in self.samples], dtype=np.float64)
-
-        base_ear = float(np.percentile(ears, 80))
-        base_ear_norm = float(np.percentile(ear_norms, 80))
-        base_left = float(np.percentile(left_ears, 80))
-        base_right = float(np.percentile(right_ears, 80))
-
-        # Must have a clear open-eye baseline
-        if base_ear < 0.18 or base_left < 0.17 or base_right < 0.17:
-            return False
-
-        # Scan candidate valley indices k
-        for k in range(1, n - 1):
-            sk = self.samples[k]
-            if sk["lap_var"] < min_acceptable_lap:
-                continue
-
-            # Gate 1: Strict bilateral geometric EAR drop (>=26% drop & >=0.052 abs drop)
-            if sk["ear"] > base_ear * BLINK_REL_DROP_RATIO:
-                continue
-            if (base_ear - sk["ear"]) < BLINK_MIN_ABS_DROP:
-                continue
-
-            # Gate 2: Pitch-compensated EAR drop (>=25% drop, blocks tilted calendar photos)
-            if sk["ear_norm"] > base_ear_norm * BLINK_NORM_DROP_RATIO:
-                continue
-
-            # Both left and right eyes must close together symmetrically
-            if sk["left_ear"] > base_left * 0.78 or sk["right_ear"] > base_right * 0.78:
-                continue
-
-            # Find open-eye frame right before blink (within 0.55s before k)
-            pre_idx = None
-            for i in range(k - 1, -1, -1):
-                if (sk["t"] - self.samples[i]["t"]) > 0.55:
-                    break
-                if self.samples[i]["ear"] >= base_ear * 0.90 and self.samples[i]["lap_var"] >= min_acceptable_lap:
-                    pre_idx = i
-                    break
-            if pre_idx is None:
-                continue
-
-            # Find open-eye recovery frame right after blink (within 0.65s after k)
-            post_idx = None
-            for j in range(k + 1, n):
-                if (self.samples[j]["t"] - sk["t"]) > 0.65:
-                    break
-                if self.samples[j]["ear"] >= base_ear * BLINK_RECOVERY_RATIO and self.samples[j]["lap_var"] >= min_acceptable_lap:
-                    post_idx = j
-                    break
-            if post_idx is None:
-                continue
-
-            # Duration of blink closure-to-recovery must be realistic (0.06s to 0.70s)
-            blink_dur = self.samples[post_idx]["t"] - self.samples[pre_idx]["t"]
-            if blink_dur < 0.06 or blink_dur > 0.70:
-                continue
-
-            s_pre = self.samples[pre_idx]
-            s_post = self.samples[post_idx]
-
-            # Gate 3: Rigid head pitch & translation stability during blink (< 7% shift)
-            pitch_ref = max(0.35, s_pre["pitch_ratio"])
-            if abs(sk["pitch_ratio"] - s_pre["pitch_ratio"]) / pitch_ref > 0.07:
-                continue
-            if abs(s_post["pitch_ratio"] - s_pre["pitch_ratio"]) / pitch_ref > 0.08:
-                continue
-
-            max_step_shift = 0.0
-            for m in range(pre_idx, post_idx):
-                step_d = float(np.linalg.norm(self.samples[m + 1]["center"] - self.samples[m]["center"]))
-                max_step_shift = max(max_step_shift, step_d)
-            if max_step_shift > 0.07 * sk["inter_ocular"]:
-                continue
-
-            # Gate 4, 5 & 6: Photometric Eyelid Closure + Differential Eye-vs-Cheek Ratio + Contrast Drop
-            if (
-                sk.get("l_patch") is not None
-                and s_pre.get("l_patch") is not None
-                and s_post.get("l_patch") is not None
-                and sk.get("ref_patch") is not None
-                and s_pre.get("ref_patch") is not None
-                and s_post.get("ref_patch") is not None
-            ):
-                eye_delta_close = 0.5 * (
-                    float(np.mean(np.abs(sk["l_patch"] - s_pre["l_patch"])))
-                    + float(np.mean(np.abs(sk["r_patch"] - s_pre["r_patch"])))
-                )
-                eye_delta_open = 0.5 * (
-                    float(np.mean(np.abs(sk["l_patch"] - s_post["l_patch"])))
-                    + float(np.mean(np.abs(sk["r_patch"] - s_post["r_patch"])))
-                )
-                eye_delta_reopen = 0.5 * (
-                    float(np.mean(np.abs(s_post["l_patch"] - s_pre["l_patch"])))
-                    + float(np.mean(np.abs(s_post["r_patch"] - s_pre["r_patch"])))
-                )
-
-                ref_delta_close = float(np.mean(np.abs(sk["ref_patch"] - s_pre["ref_patch"])))
-                ref_delta_open = float(np.mean(np.abs(sk["ref_patch"] - s_post["ref_patch"])))
-
-                # Actual eye pixels must change substantially on closure & reopening
-                if eye_delta_close < BLINK_MIN_EYE_PIXEL_DELTA or eye_delta_open < (BLINK_MIN_EYE_PIXEL_DELTA * 0.90):
-                    continue
-
-                # Open eye after blink must return close to open eye before blink
-                if eye_delta_reopen > 0.78 * max(eye_delta_close, eye_delta_open):
-                    continue
-
-                # Eye pixels must change >= 1.75x more than the rigid nose/cheek patch
-                # (completely blocks waving, tilting, or moving a printed calendar photo!)
-                if eye_delta_close < BLINK_EYE_VS_CHEEK_RATIO * max(2.2, ref_delta_close):
-                    continue
-                if eye_delta_open < (BLINK_EYE_VS_CHEEK_RATIO * 0.92) * max(2.2, ref_delta_open):
-                    continue
-
-                # Eyelid skin covering dark iris + white sclera must reduce internal eye contrast
-                open_contrast = max(float(s_pre.get("eye_contrast", 0.0)), float(s_post.get("eye_contrast", 0.0)))
-                if open_contrast > 8.0 and float(sk.get("eye_contrast", 0.0)) > open_contrast * BLINK_CONTRAST_DROP_RATIO:
-                    continue
-
-            return True
-
-        return False
+def _passive_spoof_verdict(scores: list[float]) -> tuple[bool, float]:
+    """(is_spoof, mean_p_live) from the MiniFASNet scores collected so far."""
+    if not PASSIVE_ANTISPOOF or not minifasnet.is_loaded() or len(scores) < PASSIVE_MIN_FRAMES:
+        return False, 1.0
+    mean_live = float(np.mean(scores[-20:]))
+    return mean_live < PASSIVE_LIVE_MIN, mean_live
 
 
 def capture_verified_live_enrollment(
     user_name: str = "User",
+    profile_id: str | None = None,
+    on_progress=None,
     timeout_sec: float = ENROLLMENT_TIMEOUT_SECONDS,
-) -> tuple[np.ndarray | None, str]:
+    frame_source=None,
+) -> tuple[np.ndarray | None, str, str]:
     """
-    Perform a multi-frame, photometric + geometric liveness-verified face capture for Enrollment.
-    Blocks printed photos, calendars, and phone screens by requiring:
-      1. Freshly-detected HOG face bounding box (`>= 95x95` px) on every frame (no stale boxes).
-      2. Zero 2D spoof glare/blur/flat-chrominance artifacts.
-      3. A photometrically & geometrically verified bilateral eye blink (`LivenessTracker`)
-         where eye pixels close over the iris while cheek pixels remain steady.
-      4. At least 1 pre-blink open-eye embedding AND 2 post-blink open-eye embeddings
-         (`model="large"`, `num_jitters=2`) that all match within `cos_dist <= 0.032`.
+    Liveness-verified enrollment capture.
+
+    Flow shown to the person in front of the Pi:
+      1. "Look straight at the camera"           (calibrates the straight pose)
+      2. ENROLLMENT_CHALLENGES random prompts    (LEFT / RIGHT / UP / DOWN),
+         each followed by "Look straight" again. Every turn must show real 3D
+         nose parallax — a photo or phone screen moves as a flat plane and fails.
+      3. Frontal embeddings are collected only while looking straight, checked
+         for consistency (same person the whole time) and averaged.
+      4. Rejected if the face is already registered to ANOTHER profile.
+
+    Args:
+        on_progress:  optional callable(str) — receives the current prompt, used
+                      to mirror instructions into Supabase so the app can show them.
+        frame_source: optional callable() -> BGR frame (defaults to latest_frame).
 
     Returns:
-        (normalized_embedding_or_None, error_or_status_message)
+        (embedding_or_None, human_message, camera_status_code)
+        camera_status_code is one of: completed | failed_no_face |
+        failed_spoof: <why> | failed_duplicate: <name> | failed_timeout: <why>
     """
     global active_face_locations, active_face_label, active_box_color
     global face_in_frame_status, enrollment_capture_active
 
     enrollment_capture_active = True
-    tracker = LivenessTracker()
-    pre_blink_embeddings: list[np.ndarray] = []
-    post_blink_embeddings: list[np.ndarray] = []
-    last_emb_time: float = 0.0
-    any_face_seen: bool = False
-    last_spoof_msg: str = ""
-    prev_full_box: tuple[int, int, int, int] | None = None
-    frame_counter: int = 0
+    session = ChallengeSession(
+        num_challenges=ENROLLMENT_CHALLENGES,
+        directions=(LIVENESS_LEFT, LIVENESS_RIGHT, LIVENESS_UP, LIVENESS_DOWN),
+        require_recenter=True,
+        timeout_s=timeout_sec + 5.0,  # the outer loop owns the timeout
+    )
+    frontal_embs: list[np.ndarray] = []
+    passive_scores: list[float] = []
+    last_emb_time = 0.0
+    any_face_seen = False
+    prev_full_box = None
+    frame_counter = 0
+    last_progress = None
     start_t = time.time()
 
-    log.info(
-        "[ENROLL] Starting PHOTOMETRIC LIVE-VERIFIED enrollment capture for '%s' (timeout=%.1fs)...",
-        user_name,
-        timeout_sec,
-    )
+    def _progress(text: str) -> None:
+        nonlocal last_progress
+        if text == last_progress:
+            return
+        last_progress = text
+        if on_progress is not None:
+            try:
+                on_progress(text)
+            except Exception as exc:
+                log.debug("enrollment progress callback failed: %s", exc)
+
+    def _fail(msg: str, code: str) -> tuple[None, str, str]:
+        global active_box_color, active_face_label
+        active_box_color = (0, 0, 255)
+        active_face_label = f"ENROLL FAILED: {msg}"
+        log.warning("🚫 Enrollment rejected for '%s': %s", user_name, msg)
+        return None, msg, code
+
+    log.info("[ENROLL] Live challenge enrollment started for '%s' (%d random prompts, timeout %.0fs)",
+             user_name, ENROLLMENT_CHALLENGES, timeout_sec)
+    _progress("Look straight at the camera")
 
     try:
         while (time.time() - start_t) < timeout_sec:
-            frame = latest_frame
+            frame = frame_source() if frame_source is not None else latest_frame
             if frame is None or frame.size == 0:
                 time.sleep(0.04)
                 continue
@@ -1811,93 +1642,101 @@ def capture_verified_live_enrollment(
             frame_copy = frame.copy()
             rgb_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
 
-            # Always detect fresh face box (use fast padded-ROI HOG on intermediate frames)
             full_box, best_small = _detect_face_box_fast(
-                frame_copy,
-                prev_full_box=prev_full_box,
-                use_roi_hint=(frame_counter % 4 != 0),
+                frame_copy, prev_full_box=prev_full_box, use_roi_hint=(prev_full_box is not None and frame_counter % 4 != 0)
             )
-
             if full_box is None or best_small is None:
                 face_in_frame_status = False
                 active_face_locations = []
                 prev_full_box = None
-                active_face_label = f"ENROLLING {user_name}: Position Face in Frame"
+                active_face_label = f"ENROLLING {user_name}: Position face in frame"
                 active_box_color = (0, 165, 255)
-                tracker.update(None, now=now)
+                _progress("Position your face in front of the camera")
                 time.sleep(0.04)
                 continue
 
             prev_full_box = full_box
             active_face_locations = [best_small]
             face_in_frame_status = True
-            any_face_seen = True
 
-            is_suspect_2d, spoof_reason, lap_var = _check_2d_spoof_artifacts(
-                frame_copy, full_box, min_size_px=MIN_ENROLL_FACE_SIZE_PX
-            )
-            if is_suspect_2d:
-                last_spoof_msg = spoof_reason
+            usable, why = _face_box_usable(full_box, frame_copy.shape, MIN_ENROLL_FACE_SIZE_PX)
+            if not usable:
+                active_face_label = f"ENROLLING {user_name}: {why}"
+                active_box_color = (0, 165, 255)
+                _progress(why)
+                time.sleep(0.04)
+                continue
+            any_face_seen = True
 
             with dlib_lock:
                 lm_list = face_recognition.face_landmarks(rgb_full, [full_box])
-
-            geom = _extract_face_geometry(lm_list[0], full_box, lap_var, frame_copy) if lm_list else None
-            is_live, live_msg = tracker.update(geom, is_suspect_2d, spoof_reason, now=now)
-
-            # If 2D spoof / printed photo / screen reflection is detected, block and alert
-            if is_suspect_2d:
-                last_spoof_msg = spoof_reason
-                active_box_color = (0, 0, 255)
-                active_face_label = f"SPOOF BLOCKED: {spoof_reason}"
-                time.sleep(0.04)
+            pts = landmarks_to_array(lm_list[0]) if lm_list else None
+            if pts is None:
+                time.sleep(0.03)
                 continue
 
-            # Collect clean facial encoding samples without requiring forced eye blinking
-            if (now - last_emb_time) >= 0.18:
+            res = session.update(pts, now=now)
+
+            if PASSIVE_ANTISPOOF and minifasnet.is_loaded() and frame_counter % 2 == 0:
+                _, _, _, p_live = minifasnet.predict_liveness(frame_copy, full_box)
+                passive_scores.append(p_live)
+
+            if res.state == "failed":
+                return _fail(res.prompt, f"failed_spoof: {res.prompt}")
+
+            # Frontal samples: only while looking straight (after calibration)
+            if session.is_centered(pts) and (now - last_emb_time) >= 0.25 and len(frontal_embs) < ENROLLMENT_SAMPLES_REQUIRED + 4:
                 with dlib_lock:
-                    encs = face_recognition.face_encodings(
-                        rgb_full, [full_box], num_jitters=2, model="large"
-                    )
+                    encs = face_recognition.face_encodings(rgb_full, [full_box], num_jitters=2, model="large")
                 if encs:
-                    cand_emb = _l2_norm(np.array(encs[0], dtype=np.float64))
-                    if pre_blink_embeddings:
-                        prev_dist = float(1.0 - np.dot(cand_emb, pre_blink_embeddings[0]))
-                        if prev_dist > 0.038:
-                            pre_blink_embeddings.clear()
-                            continue
-                    pre_blink_embeddings.append(cand_emb)
+                    frontal_embs.append(_l2_norm(np.array(encs[0], dtype=np.float64)))
                     last_emb_time = now
 
-            total_collected = len(pre_blink_embeddings)
-            if total_collected >= ENROLLMENT_SAMPLES_REQUIRED:
-                mean_emb = _l2_norm(np.mean(np.stack(pre_blink_embeddings, axis=0), axis=0))
+            if res.state == "passed":
+                if len(frontal_embs) < ENROLLMENT_SAMPLES_REQUIRED:
+                    active_box_color = (0, 255, 180)
+                    active_face_label = f"ENROLLING {user_name}: Look straight — capturing ({len(frontal_embs)}/{ENROLLMENT_SAMPLES_REQUIRED})"
+                    _progress("Look straight at the camera (capturing)")
+                    time.sleep(0.03)
+                    continue
+
+                is_spoof, mean_live = _passive_spoof_verdict(passive_scores)
+                if is_spoof:
+                    return _fail("Photo/screen detected by anti-spoof model",
+                                 f"failed_spoof: Photo/screen detected (live score {mean_live:.2f})")
+
+                # Same person the whole time? Drop outliers, need >= 3 consistent samples
+                stack = np.stack(frontal_embs, axis=0)
+                mean_emb = _l2_norm(np.mean(stack, axis=0))
+                dists = 1.0 - stack @ mean_emb
+                consistent = stack[dists <= 0.030]
+                if len(consistent) < 3:
+                    return _fail("Face changed during capture — one person only",
+                                 "failed_spoof: Face changed during capture (one person only)")
+                mean_emb = _l2_norm(np.mean(consistent, axis=0))
+
+                dup_id, dup_name, dup_dist = find_duplicate_profile(mean_emb, exclude_id=profile_id)
+                if dup_id is not None:
+                    return _fail(f"Face already registered as {dup_name}",
+                                 f"failed_duplicate: Face already registered as {dup_name}")
+
                 active_box_color = (0, 255, 0)
                 active_face_label = f"ENROLLED: {user_name}"
-                log.info(
-                    "[ENROLL] Enrollment successfully completed for '%s' (%d samples averaged).",
-                    user_name,
-                    len(pre_blink_embeddings),
-                )
-                return mean_emb, "completed"
+                log.info("[ENROLL] '%s' enrolled — %d samples, nearest other profile %.4f, passive live %.2f",
+                         user_name, len(consistent), dup_dist, _passive_spoof_verdict(passive_scores)[1])
+                _progress("Done — face registered")
+                return mean_emb, "completed", "completed"
 
-            # Update HUD feedback during enrollment
-            remaining = max(0.0, timeout_sec - (now - start_t))
-            active_box_color = (0, 255, 180)
-            active_face_label = f"ENROLLING {user_name} ({total_collected}/{ENROLLMENT_SAMPLES_REQUIRED})..."
-            time.sleep(0.030)
+            done, total = res.progress
+            active_box_color = (0, 255, 200) if res.state != "calibrating" else (255, 200, 0)
+            active_face_label = f"ENROLLING {user_name} [{done}/{total}]: {res.prompt}"
+            _progress(f"{res.prompt} ({done}/{total})")
+            time.sleep(0.02)
 
-        # Timeout reached without completing enrollment
         if not any_face_seen:
-            active_box_color = (0, 0, 255)
-            active_face_label = "ENROLL FAILED: No Face Detected"
-            return None, "No face detected by camera. Position face clearly in front of camera."
-
-        active_box_color = (0, 0, 255)
-        fail_msg = last_spoof_msg or "Face capture timed out. Ensure good lighting and look directly at camera."
-        active_face_label = f"ENROLL FAILED: {fail_msg}"
-        log.warning("🚫 Enrollment BLOCKED for '%s': %s", user_name, fail_msg)
-        return None, fail_msg
+            return _fail("No face detected by camera", "failed_no_face")
+        return _fail("Timed out — follow the prompts on the screen",
+                     "failed_timeout: Follow the on-screen prompts (turn your head as asked)")
     finally:
         enrollment_capture_active = False
 
@@ -2413,7 +2252,10 @@ class Picamera2Adapter:
     """Wrapper around Picamera2 to mimic OpenCV VideoCapture interface for Pi Ribbon Cameras."""
     def __init__(self) -> None:
         self.picam2 = Picamera2()
-        config = self.picam2.create_preview_configuration(main={"size": (640, 480), "format": "BGR888"})
+        # NOTE: Picamera2 names formats by register order. "RGB888" is stored as
+        # B,G,R in memory = what OpenCV expects. ("BGR888" gives R,G,B -> blue faces,
+        # which hurts recognition and makes the anti-spoof model flag real people.)
+        config = self.picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
         self.picam2.configure(config)
         self.picam2.start()
         log.info("Picamera2 CSI Ribbon Camera initialized at 640x480 (30 FPS).")
@@ -2532,40 +2374,53 @@ def run_recognition_loop(client: Client) -> None:
     cap, active_idx = smart_open_camera()
 
     # --- Background Face Recognition & Liveness Worker Thread ---
+    def _new_session() -> ChallengeSession:
+        return ChallengeSession(
+            num_challenges=RECOGNITION_CHALLENGES,
+            directions=(LIVENESS_LEFT, LIVENESS_RIGHT),
+            require_recenter=False,
+            timeout_s=12.0,
+        )
+
     def _face_worker() -> None:
         global active_face_locations, active_face_label, active_box_color
         global face_in_frame_status, last_detected_name, last_decision_time
-        log.info("⚡ Parallel Face Recognition & Anti-Spoofing worker started.")
+        log.info("⚡ Face recognition + challenge liveness worker started.")
 
-        liveness_tracker = LivenessTracker()
-        tracked_full_box: tuple[int, int, int, int] | None = None
-        frame_counter: int = 0
-        last_encoding_time: float = 0.0
-        current_faculty_id: str | None = None
-        current_name: str | None = None
-        current_distance: float = float("inf")
-        recent_match_distances: list[float] = []
-        consecutive_match_count: int = 0
-        consecutive_unknown_count: int = 0
-        post_blink_verified: bool = False
-        last_deny_log_time: float = 0.0
-        last_spoof_log_time: float = 0.0
-        last_sched_denied_id: str | None = None
-        last_sched_denied_time: float = 0.0
-        last_processed_faculty_id: str | None = None
-        last_processed_decision: str | None = None
-        last_processed_time: float = 0.0
-        no_face_frames_counter: int = 0
+        session = _new_session()
+        tracked_full_box = None
+        frame_counter = 0
+        last_encoding_time = 0.0
+        track_embs: list[tuple[float, np.ndarray]] = []   # (timestamp, embedding) for the current face track
+        passive_scores: list[float] = []
+        last_seen_time = 0.0
+        spoof_hold_until = 0.0
+        spoof_label = ""
+        last_spoof_log_time = 0.0
+        last_sched_denied_id = None
+        last_sched_denied_time = 0.0
+        last_processed_faculty_id = None
+        last_processed_decision = None
+        last_processed_time = 0.0
+        no_face_frames_counter = 0
+
+        def reset_track() -> None:
+            nonlocal session, tracked_full_box, track_embs, passive_scores
+            session = _new_session()
+            tracked_full_box = None
+            track_embs = []
+            passive_scores = []
+
+        def identify() -> tuple[str | None, str | None, float]:
+            if not track_embs:
+                return None, None, float("inf")
+            recent = [e for _, e in track_embs[-FACE_MATCH_VOTES:]]
+            return find_best_match(_l2_norm(np.mean(np.stack(recent, axis=0), axis=0)))
 
         while face_worker_running:
             try:
-                # Yield completely while active enrollment capture is running
                 if enrollment_capture_active:
-                    liveness_tracker.reset()
-                    tracked_full_box = None
-                    current_faculty_id = None
-                    recent_match_distances.clear()
-                    post_blink_verified = False
+                    reset_track()
                     time.sleep(0.05)
                     continue
 
@@ -2576,10 +2431,7 @@ def run_recognition_loop(client: Client) -> None:
                     active_face_locations = []
                     active_face_label = "SYSTEM IDLE - Maintenance Mode" if current_mode == "idle" else ""
                     active_box_color = (128, 128, 128)
-                    liveness_tracker.reset()
-                    tracked_full_box = None
-                    current_faculty_id = None
-                    recent_match_distances.clear()
+                    reset_track()
                     time.sleep(0.1)
                     continue
 
@@ -2588,8 +2440,6 @@ def run_recognition_loop(client: Client) -> None:
                 frame_copy = latest_frame.copy()
                 rgb_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
 
-                # Always detect a fresh HOG face bounding box (using fast padded-ROI HOG on intermediate frames)
-                # so `full_box` is NEVER stale when someone moves a hand or photo!
                 full_box, best_small = _detect_face_box_fast(
                     frame_copy,
                     prev_full_box=tracked_full_box,
@@ -2607,260 +2457,189 @@ def run_recognition_loop(client: Client) -> None:
                     if no_face_frames_counter > 20:
                         last_processed_faculty_id = None
                         last_processed_decision = None
-                    if (now - liveness_tracker.last_seen_time) > 0.65:
-                        current_faculty_id = None
-                        current_name = None
-                        consecutive_match_count = 0
-                        consecutive_unknown_count = 0
-                        recent_match_distances.clear()
-                    liveness_tracker.update(None, now=now)
-                    time.sleep(0.06)
-                    continue
-
-                no_face_frames_counter = 0
-                tracked_full_box = full_box
-                active_face_locations = [best_small]
-
-                # Run heuristic 2D spoof / blur check and 68-point landmark extraction
-                is_suspect_2d, spoof_reason, lap_var = _check_2d_spoof_artifacts(frame_copy, full_box)
-                with dlib_lock:
-                    lm_list = face_recognition.face_landmarks(rgb_full, [full_box])
-
-                geom = _extract_face_geometry(lm_list[0], full_box, lap_var, frame_copy) if lm_list else None
-                is_live, live_msg = liveness_tracker.update(geom, is_suspect_2d, spoof_reason, now=now)
-
-                # 2. Enrollment preview mode (before capture button is pressed)
-                if current_mode == "enrollment":
-                    if is_suspect_2d:
-                        active_box_color = (0, 165, 255)
-                        active_face_label = f"ENROLL PREVIEW: {spoof_reason}"
-                    elif is_live:
-                        active_box_color = (0, 255, 0)
-                        active_face_label = "ENROLLMENT READY - Live Face [OK]"
-                    else:
-                        active_box_color = (255, 200, 0)
-                        active_face_label = "ENROLLMENT MODE - Look at Camera"
-                    time.sleep(0.035)
-                    continue
-
-                # 3. Recognition mode — extract 128-D embedding on full-res frame when needed
-                if not is_live:
-                    post_blink_verified = False
-
-                need_encoding = (
-                    current_faculty_id is None
-                    or (now - last_encoding_time) >= 0.45
-                    or (is_live and (consecutive_match_count < REQUIRED_CONSECUTIVE_MATCHES or not post_blink_verified))
-                )
-
-                if need_encoding:
-                    if is_suspect_2d and "too small" in spoof_reason:
-                        active_box_color = (0, 165, 255)
-                        active_face_label = "Move Closer to Camera"
-                        time.sleep(0.06)
-                        continue
-
-                    with dlib_lock:
-                        face_embeddings = face_recognition.face_encodings(
-                            rgb_full, [full_box], num_jitters=1, model="large"
-                        )
-
-                    if not face_embeddings:
-                        time.sleep(0.05)
-                        continue
-
-                    live_embedding = _l2_norm(np.array(face_embeddings[0], dtype=np.float64))
-                    fid, fname, distance = find_best_match(live_embedding)
-                    last_encoding_time = now
-                    current_distance = distance
-
-                    if fid is not None:
-                        if current_faculty_id is not None and fid != current_faculty_id:
-                            # Different user stepped into frame -> reset liveness & counters
-                            liveness_tracker.reset()
-                            is_live = False
-                            post_blink_verified = False
-                            consecutive_match_count = 1
-                            recent_match_distances = [distance]
-                        else:
-                            # Verify embedding consistency before vs after blink (blocks photo swap)
-                            if liveness_tracker.pre_blink_embedding is not None:
-                                swap_dist = float(1.0 - np.dot(live_embedding, liveness_tracker.pre_blink_embedding))
-                                if swap_dist > 0.034:
-                                    log.warning("Face swap detected (dist=%.4f > 0.034) — resetting liveness.", swap_dist)
-                                    liveness_tracker.reset()
-                                    is_live = False
-                                    post_blink_verified = False
-                                    consecutive_match_count = 0
-                                    recent_match_distances.clear()
-                                elif is_live and geom is not None and geom["ear"] >= 0.19:
-                                    post_blink_verified = True
-                            elif is_live and geom is not None and geom["ear"] >= 0.19:
-                                post_blink_verified = True
-                            consecutive_match_count += 1
-                            recent_match_distances.append(distance)
-                            if len(recent_match_distances) > 6:
-                                recent_match_distances = recent_match_distances[-6:]
-
-                        current_faculty_id = fid
-                        current_name = fname
-                        consecutive_unknown_count = 0
-                        if liveness_tracker.pre_blink_embedding is None:
-                            liveness_tracker.pre_blink_embedding = live_embedding
-                    else:
-                        current_faculty_id = None
-                        current_name = None
-                        consecutive_match_count = 0
-                        recent_match_distances.clear()
-                        consecutive_unknown_count += 1
-                        post_blink_verified = False
-                        liveness_tracker.pre_blink_embedding = None
-
-                # Update status name for UI
-                if current_faculty_id and current_name:
-                    last_detected_name = current_name if is_live else f"{current_name} (Verifying)"
-                else:
-                    last_detected_name = "Face Not Found"
-
-                # Check cooldown after a recent door unlock or schedule denial
-                if (now - last_decision_time) < COOLDOWN_SECONDS:
-                    if current_faculty_id and current_name:
-                        active_face_label = f"{current_name} ({current_distance:.3f})"
-                        active_box_color = (0, 255, 0)
-                    else:
-                        active_face_label = "Face Not Found"
-                        active_box_color = (0, 165, 255)
-                    time.sleep(0.06)
-                    continue
-
-                # --- CASE A: UNKNOWN / UNREGISTERED FACE ---
-                if current_faculty_id is None:
-                    active_box_color = (0, 165, 255)  # Amber / Orange (Neutral indication, not red error)
-                    if current_distance == float("inf") or len(known_faces) == 0:
-                        active_face_label = "Face Not Found (No Registered Faces)"
-                    else:
-                        active_face_label = "Face Not Found"
-
-                    # DO NOT log to Supabase access_logs or kiosk history for unregistered / not-found faces
-                    # We do not log unknown faces into access_logs or live scan history table
-                    if consecutive_unknown_count % 30 == 0:
-                        log.debug(
-                            "Face in frame not recognized (distance=%.4f, registered_faces=%d)",
-                            current_distance,
-                            len(known_faces),
-                        )
+                    # brief detector dropouts (e.g. mid head-turn) must not restart the challenge
+                    if last_seen_time and (now - last_seen_time) > 1.2:
+                        reset_track()
                     time.sleep(0.05)
                     continue
 
-                # --- CASE B: MATCHED REGISTERED USER ---
-                avg_dist = float(np.mean(recent_match_distances)) if recent_match_distances else float("inf")
-                if consecutive_match_count < REQUIRED_CONSECUTIVE_MATCHES or avg_dist > FACE_MATCH_AVG_THRESHOLD:
-                    active_box_color = (0, 255, 180)
-                    active_face_label = f"MATCHING: {current_name}..."
+                no_face_frames_counter = 0
+                # A big jump of the box = a different face/photo was swapped in -> new track
+                if tracked_full_box is not None:
+                    pt_, pr_, pb_, pl_ = tracked_full_box
+                    t_, r_, b_, l_ = full_box
+                    jump = np.hypot((l_ + r_ - pl_ - pr_) / 2.0, (t_ + b_ - pt_ - pb_) / 2.0)
+                    if jump > 0.6 * max(1, pr_ - pl_):
+                        reset_track()
+                tracked_full_box = full_box
+                last_seen_time = now
+                active_face_locations = [best_small]
+
+                usable, why = _face_box_usable(full_box, frame_copy.shape, MIN_FACE_SIZE_PX)
+                if not usable:
+                    active_box_color = (0, 165, 255)
+                    active_face_label = why
+                    last_detected_name = why
+                    time.sleep(0.05)
+                    continue
+
+                if now < spoof_hold_until:
+                    active_box_color = (0, 0, 255)
+                    active_face_label = spoof_label
+                    last_detected_name = "Spoof Attempt"
+                    time.sleep(0.05)
+                    continue
+
+                with dlib_lock:
+                    lm_list = face_recognition.face_landmarks(rgb_full, [full_box])
+                pts = landmarks_to_array(lm_list[0]) if lm_list else None
+                if pts is None:
                     time.sleep(0.03)
                     continue
 
-                faculty_id = current_faculty_id
-                name = current_name
-                distance = avg_dist
+                # Liveness runs in parallel with identification so the door decides faster
+                live = session.update(pts, now=now) if REQUIRE_LIVENESS else None
+                if PASSIVE_ANTISPOOF and minifasnet.is_loaded() and frame_counter % 2 == 0:
+                    _, _, _, p_live = minifasnet.predict_liveness(frame_copy, full_box)
+                    passive_scores.append(p_live)
+                    passive_scores = passive_scores[-30:]
 
-                # 1. PASSIVE AI ANTI-SPOOFING CHECK (MiniFASNet - Zero Blinking)
-                is_real_ai, ai_conf, ai_label = minifasnet.predict_liveness(frame_copy, full_box)
-                if not is_real_ai:
-                    active_box_color = (0, 0, 255)  # Red box for spoof
-                    active_face_label = f"SPOOF BLOCKED: {ai_label}"
-                    last_detected_name = f"Fake Photo ({name})"
-                    if (now - last_spoof_log_time) >= 6.0:
-                        log.warning("🚫 SPOOF ATTACK BLOCKED for %s: %s (confidence=%.1f%%)", name, ai_label, ai_conf)
-                        log_access(
-                            client,
-                            decision="denied",
-                            faculty_id=faculty_id,
-                            reason=f"Denied: Spoof Attack Blocked ({ai_label}) for {name}",
-                        )
-                        add_history_entry(name, "denied", f"Spoof: {ai_label}")
-                        last_spoof_log_time = now
+                # Identity: average of the last few embeddings on this face track
+                if (now - last_encoding_time) >= 0.30:
+                    with dlib_lock:
+                        encs = face_recognition.face_encodings(rgb_full, [full_box], num_jitters=1, model="large")
+                    if encs:
+                        track_embs.append((now, _l2_norm(np.array(encs[0], dtype=np.float64))))
+                        track_embs = track_embs[-6:]
+                        last_encoding_time = now
+
+                if len(track_embs) < 2:
+                    active_box_color = (255, 200, 0)
+                    active_face_label = "Scanning face..."
+                    last_detected_name = "Scanning..."
+                    time.sleep(0.02)
+                    continue
+
+                fid, fname, distance = identify()
+
+                # Enrollment mode: preview only, the door never opens
+                if current_mode == "enrollment":
+                    active_box_color = (255, 200, 0)
+                    active_face_label = "ENROLLMENT MODE - waiting for capture request from app"
                     time.sleep(0.04)
                     continue
 
-                # Debounce: if the same person remains standing in front of camera, do not repeatedly unlock door or spam logs
-                if current_faculty_id == last_processed_faculty_id and (now - last_processed_time) < 120.0:
+                # --- UNKNOWN / UNREGISTERED FACE ---
+                if fid is None:
+                    if len(track_embs) >= FACE_MATCH_VOTES:
+                        active_box_color = (0, 165, 255)
+                        active_face_label = (
+                            "Face Not Registered" if known_faces else "Face Not Found (No Registered Faces)"
+                        )
+                        last_detected_name = "Face Not Found"
+                    else:
+                        active_box_color = (255, 200, 0)
+                        active_face_label = "Scanning face..."
+                    time.sleep(0.04)
+                    continue
+
+                # --- SPOOF EVIDENCE ---
+                passive_spoof, mean_live = _passive_spoof_verdict(passive_scores)
+                if (live is not None and live.is_spoof) or passive_spoof:
+                    reason = (live.prompt if (live is not None and live.is_spoof)
+                              else f"Photo/screen detected (live score {mean_live:.2f})")
+                    spoof_label = f"SPOOF BLOCKED: {reason}"
+                    active_box_color = (0, 0, 255)
+                    active_face_label = spoof_label
+                    last_detected_name = "Spoof Attempt"
+                    if (now - last_spoof_log_time) >= 6.0:
+                        log.warning("🚫 SPOOF BLOCKED (claimed identity: %s): %s", fname, reason)
+                        add_history_entry("Spoof Attempt", "denied", reason)
+                        log_access(client, decision="denied", faculty_id=None,
+                                   reason=f"Spoof blocked: {reason} (looked like {fname})")
+                        last_spoof_log_time = now
+                    spoof_hold_until = now + 3.0   # show red for 3 s, then start a fresh attempt
+                    reset_track()
+                    time.sleep(0.05)
+                    continue
+
+                # Debounce: same person still standing there after a decision
+                if fid == last_processed_faculty_id and (now - last_processed_time) < 120.0:
                     if last_processed_decision == "granted":
                         active_box_color = (0, 255, 0)
-                        active_face_label = f"WELCOME: {name}"
+                        active_face_label = f"WELCOME: {fname}"
                     else:
                         active_box_color = (0, 0, 255)
-                        active_face_label = f"DENIED: {name} (No Sched)"
+                        active_face_label = f"DENIED: {fname} (No Sched)"
+                    last_detected_name = fname
                     time.sleep(0.08)
                     continue
 
-                # 2. SCHEDULE VERIFICATION
+                if (now - last_decision_time) < COOLDOWN_SECONDS:
+                    active_box_color = (0, 255, 0)
+                    active_face_label = f"{fname} — please wait"
+                    time.sleep(0.06)
+                    continue
+
+                # --- LIVENESS CHALLENGE ---
+                if live is not None and not live.is_live:
+                    active_box_color = (0, 255, 200)
+                    active_face_label = f"{fname}: {live.prompt}"
+                    last_detected_name = f"{fname} (Verifying)"
+                    time.sleep(0.02)
+                    continue
+
+                # Identity must still hold AFTER the challenge (no swap during the turn)
+                if live is not None:
+                    post = [e for t, e in track_embs if t >= session.passed_at]
+                    if not post:
+                        active_box_color = (0, 255, 180)
+                        active_face_label = f"{fname}: Look straight at the camera"
+                        time.sleep(0.02)
+                        continue
+                    pfid, _, _ = find_best_match(post[-1])
+                    if pfid != fid:
+                        log.warning("Identity changed during liveness challenge — restarting.")
+                        reset_track()
+                        continue
+
+                faculty_id, name = fid, fname
+                last_detected_name = name
+
                 is_sched_ok, sched_msg, is_late, mins_late = check_faculty_schedule_status(faculty_id)
                 if is_sched_ok:
                     unlock_door()
                     if is_late:
-                        log.info(
-                            "ACCESS GRANTED (LIVE [OK], LATE by %dm) - %s (%s, avg_cos_dist=%.4f)",
-                            mins_late,
-                            name,
-                            sched_msg,
-                            distance,
-                        )
-                        log_access(
-                            client,
-                            decision="granted",
-                            faculty_id=faculty_id,
-                            reason=f"Granted (Live Verified, Late by {mins_late}m): {name} | {sched_msg}",
-                        )
-                        active_box_color = (0, 165, 255)  # Orange / Amber for Late
+                        log.info("ACCESS GRANTED (LIVE, LATE %dm) - %s (%s, cos=%.4f)", mins_late, name, sched_msg, distance)
+                        log_access(client, decision="granted", faculty_id=faculty_id,
+                                   reason=f"Granted (Live Verified, Late by {mins_late}m): {name} | {sched_msg}")
+                        active_box_color = (0, 165, 255)
                         active_face_label = f"GRANTED (LATE {mins_late}m): {name} [LIVE]"
                         add_history_entry(name, "late", f"Late by {mins_late}m ({sched_msg})")
                     else:
-                        log.info(
-                            "ACCESS GRANTED (LIVE [OK], ON TIME) - %s (%s, avg_cos_dist=%.4f)",
-                            name,
-                            sched_msg,
-                            distance,
-                        )
-                        log_access(
-                            client,
-                            decision="granted",
-                            faculty_id=faculty_id,
-                            reason=f"Granted (Live Verified): {name} | {sched_msg}",
-                        )
+                        log.info("ACCESS GRANTED (LIVE, ON TIME) - %s (%s, cos=%.4f)", name, sched_msg, distance)
+                        log_access(client, decision="granted", faculty_id=faculty_id,
+                                   reason=f"Granted (Live Verified): {name} | {sched_msg}")
                         active_box_color = (0, 255, 0)
                         active_face_label = f"GRANTED: {name} [LIVE]"
                         add_history_entry(name, "granted", f"Schedule OK ({sched_msg})")
-                    last_decision_time = now
-                    last_processed_faculty_id = faculty_id
                     last_processed_decision = "granted"
-                    last_processed_time = now
                 else:
-                    active_box_color = (0, 0, 255)  # Red box for out-of-schedule
+                    active_box_color = (0, 0, 255)
                     active_face_label = f"DENIED: {name} (No Sched)"
-                    last_detected_name = f"{name} (No Sched)"
-                    # Throttle schedule denial logging: only write to DB/logs once per person session
                     if faculty_id != last_sched_denied_id or (now - last_sched_denied_time) >= 60.0:
-                        log.info("ACCESS DENIED — %s: %s (avg_cos_dist=%.4f)", name, sched_msg, distance)
-                        log_access(
-                            client,
-                            decision="denied",
-                            faculty_id=faculty_id,
-                            reason=f"Denied: {sched_msg}",
-                        )
+                        log.info("ACCESS DENIED — %s: %s (cos=%.4f)", name, sched_msg, distance)
+                        log_access(client, decision="denied", faculty_id=faculty_id, reason=f"Denied: {sched_msg}")
                         add_history_entry(name, "denied", sched_msg)
                         last_sched_denied_id = faculty_id
                         last_sched_denied_time = now
-                    last_decision_time = now
-                    last_processed_faculty_id = faculty_id
                     last_processed_decision = "denied"
-                    last_processed_time = now
 
-                # Reset liveness after decision so the next access requires fresh face detection
-                liveness_tracker.reset()
-                consecutive_match_count = 0
-                recent_match_distances.clear()
-                post_blink_verified = False
+                last_decision_time = now
+                last_processed_faculty_id = faculty_id
+                last_processed_time = now
+                # Next attempt (or next person) needs a fresh challenge
+                session = _new_session()
                 time.sleep(0.08)
             except Exception as w_err:
                 log.warning("Face worker error: %s", w_err)

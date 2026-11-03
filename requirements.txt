@@ -6,3 +6,4 @@ face-recognition-models>=0.3.0
 supabase==2.10.0
 RPi.GPIO==0.7.1
 pygame
+onnxruntime>=1.16.0
