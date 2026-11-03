@@ -1955,6 +1955,9 @@ def add_history_entry(name: str, decision: str, reason: str) -> None:
         else:
             last_event_text = f"GRANTED: {name} - Door Unlocked"
             last_event_color = (0, 255, 120)
+    elif decision == "enrolled":
+        last_event_text = f"ENROLLED: {name} - Face Biometrics Registered"
+        last_event_color = (139, 92, 246)  # Sleek Purple for Enrollment
     elif "Outside" in reason:
         last_event_text = f"DENIED: {name} — Outside Operating Hours"
         last_event_color = (255, 165, 0)
