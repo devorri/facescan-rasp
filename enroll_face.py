@@ -78,7 +78,7 @@ def enroll_user(target: str) -> bool:
     log.info("Target Profile: %s (ID: %s)", profile_name, profile_id)
 
     # 2. Open Camera Stream & Perform Live-Verified Multi-Frame Capture
-    log.info("Initializing camera... Stand in front of camera and BLINK naturally.")
+    log.info("Initializing camera... Stand in front of camera and look naturally.")
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         log.error("Unable to open camera (/dev/video0).")
@@ -94,7 +94,7 @@ def enroll_user(target: str) -> bool:
     start_t = time.time()
 
     log.info(
-        "🛡️ Live verification active (%.0fs window): Please look at the camera and BLINK...",
+        "🛡️ Live verification active (%.0fs window): Please look at the camera...",
         ENROLLMENT_TIMEOUT_SECONDS,
     )
 
@@ -164,7 +164,7 @@ def enroll_user(target: str) -> bool:
         cap.release()
 
     log.error(
-        "🚫 ENROLLMENT BLOCKED: Liveness verification failed (static photo/calendar or no eye blink detected)."
+        "🚫 ENROLLMENT BLOCKED: Liveness verification failed (static photo or screen spoof detected)."
     )
     return False
 

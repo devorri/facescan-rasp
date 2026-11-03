@@ -425,8 +425,10 @@ def check_faculty_schedule_status(faculty_id: str) -> tuple[bool, str, bool, int
     with known_faces_lock:
         profile_match = next((p for p in known_faces if str(p.get("id")) == str(faculty_id)), None)
         if profile_match:
-            role = str(profile_match.get("role", "")).lower()
-            if "custodian" in role or "admin" in role:
+            role = str(profile_match.get("role", "")).strip().lower()
+            # Only true Custodians or direct Admins get 24/7 master access.
+            # Regular faculty (even in Admin departments) must follow scheduled laboratory hours.
+            if (role == "custodian" or role == "admin" or role.startswith("custodian")) and not role.startswith("faculty"):
                 return True, f"Custodian Master Access ({profile_match.get('role')})", False, 0
 
     now_struct = time.localtime()
@@ -524,7 +526,7 @@ def start_realtime_listener(client: Client) -> None:
             log.debug("pi_status push skipped: %s", exc)
 
     def poll_forever() -> None:
-        global enrollment_status, enrollment_name, pi_mode
+        global enrollment_status, enrollment_name, pi_mode, last_decision_time
         log.info("Background profile sync & capture daemon active (polling every 2s).")
         cycle = 0
         last_pushed_tuple = None
@@ -576,15 +578,21 @@ def start_realtime_listener(client: Client) -> None:
                                     }).eq("id", pid).execute()
                                     enrollment_status = "completed"
                                     add_history_entry(pname, "enrolled", "Face Biometrics Enrolled")
-                                    last_decision_time = time.time() + 15.0  # 15s grace cooldown
+                                    # Log official enrollment in Supabase access_logs so live scan logs show ENROLLED
+                                    log_access(
+                                        client,
+                                        decision="granted",
+                                        faculty_id=pid,
+                                        reason=f"Enrolled: Face biometrics registered for {pname}",
+                                    )
+                                    last_decision_time = time.time() + 25.0  # 25s grace cooldown
                                     log.info(f"✅ Face embedding enrolled for '{pname}'!")
                                     reload_known_faces(client)
                                 else:
-                                    status_code = "failed_spoof" if ("Liveness" in err_msg or "Pictures" in err_msg) else "failed_no_face"
+                                    status_code = "failed_no_face" if "No face" in err_msg else f"failed_spoof: {err_msg}"
                                     client.table("profiles").update({"camera_status": status_code}).eq("id", pid).execute()
                                     enrollment_status = status_code
-                                    if status_code == "failed_spoof":
-                                        add_history_entry(pname, "denied", "Enroll Blocked: Spoof/Photo Rejected")
+                                    add_history_entry(pname, "denied", f"Enroll Rejected: {err_msg}")
                                     log.warning("⚠️ Pending capture rejected for '%s' (%s): %s", pname, status_code, err_msg)
                             else:
                                 log.warning("⚠️ latest_frame is None — main loop camera not ready yet. Retrying next cycle.")
@@ -790,14 +798,16 @@ class EnrollmentRequestHandler(BaseHTTPRequestHandler):
                 res = self.supabase_client.table("profiles").select("name").eq("id", profile_id).execute()
                 pname = res.data[0]["name"] if (res.data and len(res.data) > 0) else "User"
 
-                global enrollment_status, enrollment_name
+                global enrollment_status, enrollment_name, last_decision_time
                 enrollment_name = pname
                 enrollment_status = "capturing"
 
                 embedding, err_msg = capture_verified_live_enrollment(user_name=pname)
                 if embedding is None:
-                    enrollment_status = "failed_spoof" if ("Liveness" in err_msg or "Pictures" in err_msg) else "failed_no_face"
-                    add_history_entry(pname, "denied", "Enroll Blocked: Spoof/Photo Rejected" if enrollment_status == "failed_spoof" else "Enroll Failed: No Face")
+                    status_code = "failed_no_face" if "No face" in err_msg else f"failed_spoof: {err_msg}"
+                    enrollment_status = status_code
+                    self.supabase_client.table("profiles").update({"camera_status": status_code}).eq("id", profile_id).execute()
+                    add_history_entry(pname, "denied", f"Enroll Rejected: {err_msg}")
                     self._send_json(400, {"success": False, "error": err_msg})
                     return
 
@@ -814,7 +824,13 @@ class EnrollmentRequestHandler(BaseHTTPRequestHandler):
                 reload_known_faces(self.supabase_client)
 
                 add_history_entry(pname, "enrolled", "Live Face Enrolled via Pi Camera")
-                last_decision_time = time.time() + 15.0  # 15s grace cooldown
+                log_access(
+                    self.supabase_client,
+                    decision="granted",
+                    faculty_id=profile_id,
+                    reason=f"Enrolled: Face biometrics registered for {pname}",
+                )
+                last_decision_time = time.time() + 25.0  # 25s grace cooldown
                 log.info(f"✅ ENROLLMENT SUCCESSFUL for {pname}")
 
                 self._send_json(200, {"success": True, "name": pname})
@@ -1552,22 +1568,22 @@ class LivenessTracker:
         if self.is_live and (now - self.live_confirmed_time) > 4.5:
             self.is_live = False
 
-        min_samples = 3 if mrl_classifier.is_loaded() else 5
+        # Passive live face verification (zero forced eye blinking needed)
+        # Verifies natural face geometry, sharpness, and absence of 2D photo/screen spoof artifacts
+        min_samples = 3
         if not self.is_live and len(self.samples) >= min_samples:
-            if self._detect_verified_blink():
+            if not is_suspect_2d:
                 self.is_live = True
-                self.blink_count += 1
                 self.live_confirmed_time = now
                 self.spoof_reason = ""
-                log.info("[LIVENESS] Verified via photometric + geometric eye blink (total=%d).", self.blink_count)
+                log.info("[LIVENESS] Verified live face (texture, geometry, no spoof artifacts).")
 
         if self.is_live:
             return True, "LIVE VERIFIED [OK]"
 
-        elapsed = now - self.first_seen_time
-        if elapsed >= SPOOF_ALERT_SECONDS:
-            return False, "STATIC PHOTO / SPOOF? Blink Eyes"
-        return False, "BLINK EYES to Verify Live Face"
+        if is_suspect_2d:
+            return False, f"Spoof Blocked: {spoof_reason}"
+        return False, "Position Face in Front of Camera"
 
     def _detect_verified_blink(self) -> bool:
         """
@@ -1878,13 +1894,10 @@ def capture_verified_live_enrollment(
             return None, "No face detected by camera. Position face clearly in front of camera."
 
         active_box_color = (0, 0, 255)
-        active_face_label = f"ENROLL FAILED: {last_spoof_msg or 'Capture Timed Out'}"
-        reason_detail = (
-            f"Enrollment blocked ({last_spoof_msg or 'face capture timed out'}). "
-            "Please ensure clear lighting and position your face in front of the lens."
-        )
-        log.warning("🚫 Enrollment BLOCKED for '%s': %s", user_name, reason_detail)
-        return None, reason_detail
+        fail_msg = last_spoof_msg or "Face capture timed out. Ensure good lighting and look directly at camera."
+        active_face_label = f"ENROLL FAILED: {fail_msg}"
+        log.warning("🚫 Enrollment BLOCKED for '%s': %s", user_name, fail_msg)
+        return None, fail_msg
     finally:
         enrollment_capture_active = False
 
@@ -2159,15 +2172,20 @@ def render_pygame_kiosk(
     enroll_labels = {
         "idle":          "IDLE - Awaiting app request",
         "pending":       f"PENDING - {enrollment_name or 'User'}",
-        "capturing":     f"BLINK TO ENROLL - {enrollment_name or 'User'}",
+        "capturing":     f"ENROLLING - {enrollment_name or 'User'}",
         "completed":     f"DONE - {enrollment_name or 'User'} Enrolled!",
         "failed_spoof":     "BLOCKED - Photo/Spoof Rejected!",
         "failed_no_face":   "FAILED - No live face detected",
         "failed_camera_error": "FAILED - Camera error",
         "failed_camera_offline": "FAILED - Camera offline",
     }
-    en_col = enroll_colors.get(enrollment_status, TEXT_MUTED)
-    en_txt = enroll_labels.get(enrollment_status, enrollment_status.upper())
+    if enrollment_status.startswith("failed_spoof"):
+        en_col = RED
+        reason_part = enrollment_status.replace("failed_spoof:", "").strip()
+        en_txt = f"BLOCKED - {reason_part}" if reason_part else "BLOCKED - Spoof Rejected"
+    else:
+        en_col = enroll_colors.get(enrollment_status, TEXT_MUTED)
+        en_txt = enroll_labels.get(enrollment_status, enrollment_status.upper())
     en_lbl = fonts["small"].render("Enroll:", True, TEXT_MUTED)
     en_val = fonts["small_bold"].render(en_txt[:26], True, en_col)
     screen.blit(en_lbl, (right_x + 16, 353))
@@ -2531,6 +2549,10 @@ def run_recognition_loop(client: Client) -> None:
         last_spoof_log_time: float = 0.0
         last_sched_denied_id: str | None = None
         last_sched_denied_time: float = 0.0
+        last_processed_faculty_id: str | None = None
+        last_processed_decision: str | None = None
+        last_processed_time: float = 0.0
+        no_face_frames_counter: int = 0
 
         while face_worker_running:
             try:
@@ -2578,6 +2600,10 @@ def run_recognition_loop(client: Client) -> None:
                     active_box_color = (255, 255, 255)
                     last_detected_name = ""
                     tracked_full_box = None
+                    no_face_frames_counter += 1
+                    if no_face_frames_counter > 20:
+                        last_processed_faculty_id = None
+                        last_processed_decision = None
                     if (now - liveness_tracker.last_seen_time) > 0.65:
                         current_faculty_id = None
                         current_name = None
@@ -2588,6 +2614,7 @@ def run_recognition_loop(client: Client) -> None:
                     time.sleep(0.06)
                     continue
 
+                no_face_frames_counter = 0
                 tracked_full_box = full_box
                 active_face_locations = [best_small]
 
@@ -2609,7 +2636,7 @@ def run_recognition_loop(client: Client) -> None:
                         active_face_label = "ENROLLMENT READY - Live Face [OK]"
                     else:
                         active_box_color = (255, 200, 0)
-                        active_face_label = "ENROLLMENT MODE - Blink to Test Liveness"
+                        active_face_label = "ENROLLMENT MODE - Look at Camera"
                     time.sleep(0.035)
                     continue
 
@@ -2688,7 +2715,7 @@ def run_recognition_loop(client: Client) -> None:
 
                 # Update status name for UI
                 if current_faculty_id and current_name:
-                    last_detected_name = current_name if is_live else f"{current_name} (Verify Blink)"
+                    last_detected_name = current_name if is_live else f"{current_name} (Verifying)"
                 else:
                     last_detected_name = "Face Not Found"
 
@@ -2753,6 +2780,17 @@ def run_recognition_loop(client: Client) -> None:
                     time.sleep(0.04)
                     continue
 
+                # Debounce: if the same person remains standing in front of camera, do not repeatedly unlock door or spam logs
+                if current_faculty_id == last_processed_faculty_id and (now - last_processed_time) < 120.0:
+                    if last_processed_decision == "granted":
+                        active_box_color = (0, 255, 0)
+                        active_face_label = f"WELCOME: {name}"
+                    else:
+                        active_box_color = (0, 0, 255)
+                        active_face_label = f"DENIED: {name} (No Sched)"
+                    time.sleep(0.08)
+                    continue
+
                 # 2. SCHEDULE VERIFICATION
                 is_sched_ok, sched_msg, is_late, mins_late = check_faculty_schedule_status(faculty_id)
                 if is_sched_ok:
@@ -2791,11 +2829,14 @@ def run_recognition_loop(client: Client) -> None:
                         active_face_label = f"GRANTED: {name} [LIVE]"
                         add_history_entry(name, "granted", f"Schedule OK ({sched_msg})")
                     last_decision_time = now
+                    last_processed_faculty_id = faculty_id
+                    last_processed_decision = "granted"
+                    last_processed_time = now
                 else:
                     active_box_color = (0, 0, 255)  # Red box for out-of-schedule
                     active_face_label = f"DENIED: {name} (No Sched)"
                     last_detected_name = f"{name} (No Sched)"
-                    # Throttle schedule denial logging: only write to DB/logs once per 60s for the same person
+                    # Throttle schedule denial logging: only write to DB/logs once per person session
                     if faculty_id != last_sched_denied_id or (now - last_sched_denied_time) >= 60.0:
                         log.info("ACCESS DENIED — %s: %s (avg_cos_dist=%.4f)", name, sched_msg, distance)
                         log_access(
@@ -2808,8 +2849,11 @@ def run_recognition_loop(client: Client) -> None:
                         last_sched_denied_id = faculty_id
                         last_sched_denied_time = now
                     last_decision_time = now
+                    last_processed_faculty_id = faculty_id
+                    last_processed_decision = "denied"
+                    last_processed_time = now
 
-                # Reset liveness after decision so the next access requires a fresh blink
+                # Reset liveness after decision so the next access requires fresh face detection
                 liveness_tracker.reset()
                 consecutive_match_count = 0
                 recent_match_distances.clear()
